@@ -14,8 +14,9 @@
 
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, fields
+from functools import wraps
 from typing import Any, Callable, Optional, Sequence
 
 import torch
@@ -60,6 +61,43 @@ from .utils import (
 )
 
 logger = logging.getLogger(__file__)
+
+
+@contextmanager
+def _engine_parallel_context(engine):
+    previous_group = get_ulysses_sequence_parallel_group()
+    with parallel_state.use_parallel_state(engine.parallel_state):
+        set_ulysses_sequence_parallel_group(engine.ulysses_parallel_group)
+        try:
+            yield
+        finally:
+            set_ulysses_sequence_parallel_group(previous_group)
+
+
+def _with_engine_parallel_state(method):
+    @wraps(method)
+    def scoped(self, *args, **kwargs):
+        with _engine_parallel_context(self):
+            return method(self, *args, **kwargs)
+
+    return scoped
+
+
+def _iter_with_engine_parallel_state(engine, iterator):
+    # Restore ambient state before yielding to the weight transport.
+    try:
+        while True:
+            with _engine_parallel_context(engine):
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    return
+            yield item
+    finally:
+        with _engine_parallel_context(engine):
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
 
 
 def _build_ops_implementation_config(engine_config: VeOmniEngineConfig) -> OpsImplementationConfig:
@@ -180,7 +218,7 @@ class VeOmniEngine(FSDPEngine):
         # Actor and reference engines may initialize in the same process.
         # Keep their meshes unnamed so the trainer's 'base' registry entry
         # cannot cause a later engine's topology to be silently ignored.
-        parallel_state.init_parallel_state_from_config(accelerator, name=None)
+        self.parallel_state = parallel_state.init_parallel_state_from_config(accelerator, name=None)
 
         if self.engine_config.full_determinism:
             enable_full_determinism(seed=self.engine_config.seed)
@@ -196,11 +234,11 @@ class VeOmniEngine(FSDPEngine):
         # the FSDP engine; the VeOmni engine has the same paths and needs the same guard).
         self._uses_fsdp2_cpu_offload_policy = self.engine_config.enable_fsdp_offload
 
-        self.use_ulysses_sp = parallel_state.get_parallel_state().sp_enabled
+        self.use_ulysses_sp = self.parallel_state.sp_enabled
         self.ulysses_sequence_parallel_size = self.engine_config.ulysses_parallel_size
 
         if self.use_ulysses_sp:
-            self.ulysses_parallel_group = parallel_state.get_parallel_state().device_mesh["sp"].get_group()
+            self.ulysses_parallel_group = self.parallel_state.device_mesh["sp"].get_group()
         else:
             self.ulysses_parallel_group = None
 
@@ -226,6 +264,7 @@ class VeOmniEngine(FSDPEngine):
         self.pad_to_length: bool = self.engine_config.pad_to_length
         self.pad_to_length_bucket: int = self.engine_config.pad_to_length_bucket
 
+    @_with_engine_parallel_state
     def initialize(self):
         """
         Build the model, optimizer, and learning rate scheduler under VeOmni.
@@ -401,6 +440,7 @@ class VeOmniEngine(FSDPEngine):
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
 
+    @_with_engine_parallel_state
     def optimizer_step(self):
         """
         Perform an optimization step using the optimizer.
@@ -421,6 +461,7 @@ class VeOmniEngine(FSDPEngine):
             self.optimizer.step()
         return grad_norm.item()
 
+    @_with_engine_parallel_state
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
         """
         Perform a forward pass and optionally a backward pass on a batch of data.
@@ -486,14 +527,14 @@ class VeOmniEngine(FSDPEngine):
                 self._router_replay.clear()
 
     def get_data_parallel_rank(self):
-        return parallel_state.get_parallel_state().device_mesh.get_local_rank("dp")
+        return self.parallel_state.device_mesh.get_local_rank("dp")
 
     def get_data_parallel_size(self):
-        return torch.distributed.get_world_size() // parallel_state.get_parallel_state().ulysses_size
+        return torch.distributed.get_world_size() // self.parallel_state.ulysses_size
 
     def get_data_parallel_group(self):
-        if parallel_state.get_parallel_state().ulysses_size > 1:
-            return parallel_state.get_parallel_state().device_mesh.get_group(mesh_dim="dp")
+        if self.parallel_state.ulysses_size > 1:
+            return self.parallel_state.device_mesh.get_group(mesh_dim="dp")
         else:
             return torch.distributed.group.WORLD
 
@@ -507,8 +548,8 @@ class VeOmniEngine(FSDPEngine):
         """
         Whether the current rank is the first rank in model parallel group that contains model outputs
         """
-        if parallel_state.get_parallel_state().ulysses_size > 1:
-            is_collect = parallel_state.get_parallel_state().device_mesh["ulysses"].get_local_rank() == 0
+        if self.parallel_state.ulysses_size > 1:
+            is_collect = self.parallel_state.device_mesh["ulysses"].get_local_rank() == 0
         else:
             is_collect = True
         return is_collect
@@ -529,6 +570,7 @@ class VeOmniEngine(FSDPEngine):
         """
         return EngineEvalModeCtx(self, **kwargs)
 
+    @_with_engine_parallel_state
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         """
         Move model parameters, optimizer states, or both to the specified device.
@@ -557,6 +599,7 @@ class VeOmniEngine(FSDPEngine):
         else:
             raise ValueError(f"Invalid device type: {device}")
 
+    @_with_engine_parallel_state
     def save_checkpoint(
         self,
         local_path: str,
@@ -582,6 +625,7 @@ class VeOmniEngine(FSDPEngine):
         if self._is_offload_param:
             offload_veomni_model_to_cpu(self.module)
 
+    @_with_engine_parallel_state
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
     ) -> None:
@@ -602,6 +646,7 @@ class VeOmniEngine(FSDPEngine):
         if self._is_offload_optimizer:
             offload_veomni_optimizer(self.optimizer)
 
+    @_with_engine_parallel_state
     def get_per_tensor_param_shard(self, **kwargs):
         """Yield each rank's *local* shard ``(name, local_shard, ShardSpec)`` -- the
         DTensor export plus veomni's EP declarations. The mechanics live in
@@ -611,6 +656,11 @@ class VeOmniEngine(FSDPEngine):
         offload-back happens here, after the exporter is exhausted).
         """
         from .utils import veomni_shard_export
+
+        if self.module.config.model_type == "minimax_m3_vl":
+            raise NotImplementedError(
+                "M3 public-layout export requires full weight synchronization; disable delta/shard export"
+            )
 
         manual_offload = not getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
         if manual_offload:
@@ -622,7 +672,7 @@ class VeOmniEngine(FSDPEngine):
             if manual_offload and self._is_offload_param:
                 offload_veomni_model_to_cpu(self.module)
 
-        return _with_offload_back(), meta
+        return _iter_with_engine_parallel_state(self, _with_offload_back()), meta
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
         """veomni's per-param entry builder: EP/converter specs (fused expert
@@ -642,6 +692,7 @@ class VeOmniEngine(FSDPEngine):
     # prime_delta_snapshots from BaseEngine; both consume this class's
     # get_per_tensor_param_shard and _hf_delta_entry overrides.
 
+    @_with_engine_parallel_state
     def get_per_tensor_param(self, **kwargs):
         # FSDP2 CPUOffloadPolicy owns CPU<->accelerator placement; calling model.to(device)
         # here leaves the module half-moved and crashes state_dict() below (#5995). The
@@ -653,7 +704,7 @@ class VeOmniEngine(FSDPEngine):
         # TODO: currently only for DeepseekV4, unify all models to export weights by converter.
         converter = get_checkpoint_tensor_converter(self.module)
         if converter is not None and hasattr(converter, "export_weights"):
-            return converter.export_weights(self.module), None
+            return _iter_with_engine_parallel_state(self, converter.export_weights(self.module)), None
 
         params = self.module.state_dict()
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
@@ -663,6 +714,11 @@ class VeOmniEngine(FSDPEngine):
 
         ps = parallel_state.get_parallel_state()
         model_type = getattr(self.module.config, "model_type", "default")
+        if model_type == "minimax_m3_vl":
+            from .m3_weight_export import iter_m3_param
+
+            params_iter = iter_m3_param(params, self.module.config, ps, get_device_id())
+            return _iter_with_engine_parallel_state(self, params_iter), None
         process_func = get_moe_param_handler(model_type, ps.ep_enabled)
 
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
@@ -691,7 +747,7 @@ class VeOmniEngine(FSDPEngine):
                         yield name, unsharded_tensor
 
         # TODO: support VeOmni LoRA
-        return param_generator(), None
+        return _iter_with_engine_parallel_state(self, param_generator()), None
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
@@ -700,24 +756,26 @@ class EngineEvalModeCtx(BaseEngineCtx):
 
     def __enter__(self):
         assert isinstance(self.engine, VeOmniEngine)
-        super().__enter__()
-        self.prev_sp_group = get_ulysses_sequence_parallel_group()
-        set_ulysses_sequence_parallel_group(self.engine.ulysses_parallel_group)
-        self.engine.module.train()
+        self.parallel_context = _engine_parallel_context(self.engine)
+        self.parallel_context.__enter__()
+        try:
+            super().__enter__()
+            self.engine.module.train()
+        except BaseException:
+            self.parallel_context.__exit__(None, None, None)
+            raise
 
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, VeOmniEngine)
-        set_ulysses_sequence_parallel_group(self.prev_sp_group)
-
-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
-        if parallel_state.get_parallel_state().dp_shard_size > 1:
-            if fsdp_version(self.engine.module) == 1:
-                self.engine.module._handle.reshard(True)
-            elif fsdp_version(self.engine.module) == 2:
-                self.engine.module.reshard()
-
-        super().__exit__(exc_type, exc_value, traceback)
+        try:
+            if self.engine.parallel_state.dp_shard_size > 1:
+                if fsdp_version(self.engine.module) == 1:
+                    self.engine.module._handle.reshard(True)
+                elif fsdp_version(self.engine.module) == 2:
+                    self.engine.module.reshard()
+            super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.parallel_context.__exit__(exc_type, exc_value, traceback)
 
 
 class EngineTrainModeCtx(BaseEngineCtx):
@@ -726,19 +784,23 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
     def __enter__(self):
         assert isinstance(self.engine, VeOmniEngine)
-        super().__enter__()
-        self.prev_sp_group = get_ulysses_sequence_parallel_group()
-        set_ulysses_sequence_parallel_group(self.engine.ulysses_parallel_group)
-        # TODO: Switch to eval mode after Integrating the CI environment
-        # VeOmni (ref: https://github.com/ByteDance-Seed/VeOmni/pull/421)
-        self.engine.module.train()
+        self.parallel_context = _engine_parallel_context(self.engine)
+        self.parallel_context.__enter__()
+        try:
+            super().__enter__()
+            self.engine.module.train()
+        except BaseException:
+            self.parallel_context.__exit__(None, None, None)
+            raise
 
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, VeOmniEngine)
-        set_ulysses_sequence_parallel_group(self.prev_sp_group)
-        if self.zero_grad_on_exit or exc_type is not None:
-            self.engine.optimizer_zero_grad()
-        super().__exit__(exc_type, exc_value, traceback)
+        try:
+            if self.zero_grad_on_exit or exc_type is not None:
+                self.engine.optimizer_zero_grad()
+            super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.parallel_context.__exit__(exc_type, exc_value, traceback)
 
 
 @dataclass

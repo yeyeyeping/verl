@@ -444,6 +444,7 @@ class VeOmniEngineConfig(EngineConfig):
     chunk_gated_delta_rule_implementation: str = "eager"
     dsa_indexer_implementation: str = "eager"
     dsa_attention_implementation: str = "eager"
+    minimax_sparse_attention_implementation: str = "eager"
     mhc_implementation: str = "eager"
     qat_implementation: str = "none"
     force_use_huggingface: bool = False

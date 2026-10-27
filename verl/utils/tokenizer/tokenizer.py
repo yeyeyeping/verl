@@ -193,14 +193,33 @@ def hf_processor(name_or_path, **kwargs):
     from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizerBase
 
     try:
-        processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
+        config = AutoConfig.from_pretrained(name_or_path, **kwargs)
+        if config.model_type == "minimax_m3_vl":
+            # The released remote MiniMaxVLProcessor drops chat_template and
+            # uses the pre-v5 image layout. Build native components explicitly,
+            # as VeOmni's M3 processor does, without requiring VeOmni here.
+            from transformers import (
+                AutoTokenizer,
+                MiniMaxM3VLImageProcessor,
+                MiniMaxM3VLProcessor,
+                MiniMaxM3VLVideoProcessor,
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+            native_kwargs = {k: v for k, v in kwargs.items() if k != "trust_remote_code"}
+            processor = MiniMaxM3VLProcessor(
+                tokenizer=tokenizer,
+                image_processor=MiniMaxM3VLImageProcessor.from_pretrained(name_or_path, **native_kwargs),
+                video_processor=MiniMaxM3VLVideoProcessor.from_pretrained(name_or_path, **native_kwargs),
+                chat_template=tokenizer.chat_template,
+            )
+        else:
+            processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
         # In newer transformers, AutoProcessor may legitimately fall back to a
         # tokenizer backend (e.g. TokenizersBackend) for text-only models.
         # Treat it as "no multimodal processor" and let callers use hf_tokenizer.
         if isinstance(processor, PreTrainedTokenizerBase):
             return None
-
-        config = AutoConfig.from_pretrained(name_or_path, **kwargs)
 
         # Bind vlm model's get_rope_index method to processor.
         processor.config = config
@@ -228,6 +247,8 @@ def hf_processor(name_or_path, **kwargs):
                 model_class = Glm46VModel
             case "MllamaProcessor":
                 pass  # MllamaProcessor and MllamaModel doesn't have get_rope_index property
+            case "MiniMaxM3VLProcessor":
+                pass  # Text positions are 1D; vision RoPE is applied inside the vision tower.
             case "Gemma4Processor":
                 # Gemma4 uses standard 1D RoPE -> no get_rope_index to bind. Disable its strict
                 # per-image-token check (which Qwen's processor lacks).

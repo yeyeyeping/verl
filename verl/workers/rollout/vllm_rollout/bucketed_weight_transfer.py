@@ -138,11 +138,10 @@ class BucketedWeightSender:
                     offset = 0
 
                 if offset + weight.nbytes > self.bucket_size:
-                    assert not self.use_shm, (
-                        f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
-                        f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
-                    )
-                    self._direct_send_large_weight(name, weight)
+                    if self.use_shm:
+                        self._send_large_weight_shm(name, weight)
+                    else:
+                        self._direct_send_large_weight(name, weight)
                     continue
 
                 bucket_meta[name] = {
@@ -153,7 +152,7 @@ class BucketedWeightSender:
                     "handle": None,
                 }
                 self.buffer[offset : offset + weight.nbytes].view(dtype=weight.dtype).view(weight.shape).copy_(
-                    weight, non_blocking=True
+                    weight, non_blocking=not self.use_shm
                 )
                 offset += weight.nbytes
 
@@ -216,9 +215,29 @@ class BucketedWeightSender:
             self.shm.unlink()
             del self.shm
             self.shm = None
-        if is_support_ipc():
+        if not self.use_shm and is_support_ipc():
             get_torch_device().ipc_collect()
         get_torch_device().empty_cache()
+
+    def _send_large_weight_shm(self, name: str, weight: torch.Tensor):
+        """Stream a large embedding through the existing bounded CPU buffer."""
+        flat = weight.detach().contiguous().view(torch.uint8).view(-1)
+        for offset in range(0, flat.numel(), self.bucket_size):
+            size = min(self.bucket_size, flat.numel() - offset)
+            # NPU -> host must finish before the receiver reads the shared pages.
+            self.buffer[:size].copy_(flat[offset : offset + size], non_blocking=False)
+            self.socket.send_pyobj(
+                {
+                    "large_tensor": {
+                        "name": name,
+                        "shape": weight.shape,
+                        "dtype": weight.dtype,
+                        "offset": offset,
+                        "size": size,
+                    }
+                }
+            )
+            self.socket.recv()
 
     def _direct_send_large_weight(self, name: str, weight: torch.Tensor):
         """Send a weight larger than the bucket size via cuda ipc or share memory."""
@@ -282,8 +301,40 @@ class BucketedWeightReceiver:
             self._init_buffer()
 
             # receive bucket and update weights
+            pending_tensor, pending_name, pending_offset = None, None, 0
             while True:
                 metadata = self.socket.recv_pyobj()
+                if "large_tensor" in metadata:
+                    meta = metadata["large_tensor"]
+                    if not self.use_shm:
+                        raise ValueError("Chunked host transfer requires shared memory")
+                    if pending_tensor is None:
+                        if meta["offset"] != 0:
+                            raise ValueError("Large tensor must start at byte zero")
+                        pending_tensor = torch.empty(meta["shape"], dtype=meta["dtype"], device=self.device)
+                        pending_name, pending_offset = meta["name"], 0
+                    size = meta["size"]
+                    if (
+                        meta["name"] != pending_name
+                        or meta["offset"] != pending_offset
+                        or tuple(meta["shape"]) != tuple(pending_tensor.shape)
+                        or meta["dtype"] != pending_tensor.dtype
+                        or not 0 < size <= self.buffer.numel()
+                        or pending_offset + size > pending_tensor.nbytes
+                    ):
+                        raise ValueError("Invalid or out-of-order large tensor chunk")
+                    pending_tensor.view(torch.uint8).view(-1)[pending_offset : pending_offset + size].copy_(
+                        self.buffer[:size], non_blocking=False
+                    )
+                    pending_offset += size
+                    if pending_offset == pending_tensor.nbytes:
+                        on_bucket_received([(pending_name, pending_tensor)], False)
+                        get_torch_device().synchronize()
+                        pending_tensor, pending_name, pending_offset = None, None, 0
+                    self.socket.send(b"")
+                    continue
+                if pending_tensor is not None:
+                    raise ValueError("Incomplete large tensor before the next weight bucket")
                 weights, tensor = [], None
                 for name, meta in metadata["bucket_meta"].items():
                     shape, dtype, offset, handle = meta["shape"], meta["dtype"], meta["offset"], meta["handle"]
@@ -340,7 +391,7 @@ class BucketedWeightReceiver:
             self.shm.close()
             del self.shm
             self.shm = None
-        if is_support_ipc():
+        if not self.use_shm and is_support_ipc():
             get_torch_device().ipc_collect()
         get_torch_device().empty_cache()
         # Ack last, after the buffer is released: the sender reclaims its bucket

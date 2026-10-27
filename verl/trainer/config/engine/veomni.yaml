@@ -79,6 +79,7 @@ chunk_gated_delta_rule_implementation: eager
 load_balancing_loss_implementation: eager
 dsa_indexer_implementation: eager
 dsa_attention_implementation: eager
+minimax_sparse_attention_implementation: eager
 mhc_implementation: eager
 qat_implementation: none
 

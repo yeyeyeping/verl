@@ -18,6 +18,7 @@ engine tests, then exercise the config-based parallel-state API explicitly in th
 """
 
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -111,6 +112,56 @@ def test_invalid_hsdp_fails_before_mesh_creation(monkeypatch, parallel_state):
     with pytest.raises(ValueError, match="must be divisible by fsdp_size"):
         _init_engine(monkeypatch, parallel_state, fsdp_size=3)
     parallel_state.init_parallel_state_from_config.assert_not_called()
+
+
+def test_engine_uses_returned_mesh_not_ambient(monkeypatch, parallel_state):
+    monkeypatch.setattr(transformer_impl, "AcceleratorConfig", MagicMock(return_value=SimpleNamespace(dp_size=8)))
+    monkeypatch.setattr(transformer_impl, "FSDPConfig", MagicMock())
+    own = SimpleNamespace(sp_enabled=False)
+    parallel_state.init_parallel_state_from_config.return_value = own
+    parallel_state.get_parallel_state.return_value = SimpleNamespace(sp_enabled=True)
+    engine = _init_engine(monkeypatch, parallel_state)
+    assert engine.parallel_state is own
+    assert engine.use_ulysses_sp is False
+
+
+def test_scopes_restore_actor_ref_and_generator_exceptions(monkeypatch):
+    current = {"state": "outside", "sp": "outside-sp"}
+
+    @contextmanager
+    def use(state):
+        previous = current["state"]
+        current["state"] = state
+        try:
+            yield
+        finally:
+            current["state"] = previous
+
+    monkeypatch.setattr(transformer_impl, "parallel_state", SimpleNamespace(use_parallel_state=use))
+    monkeypatch.setattr(transformer_impl, "get_ulysses_sequence_parallel_group", lambda: current["sp"])
+    monkeypatch.setattr(transformer_impl, "set_ulysses_sequence_parallel_group", lambda group: current.update(sp=group))
+    actor = SimpleNamespace(parallel_state="actor", ulysses_parallel_group="actor-sp")
+    ref = SimpleNamespace(parallel_state="ref", ulysses_parallel_group="ref-sp")
+    with transformer_impl._engine_parallel_context(actor):
+        assert current == {"state": "actor", "sp": "actor-sp"}
+        with pytest.raises(RuntimeError), transformer_impl._engine_parallel_context(ref):
+            assert current == {"state": "ref", "sp": "ref-sp"}
+            raise RuntimeError("forward failed")
+        assert current["state"] == "actor"
+    assert current == {"state": "outside", "sp": "outside-sp"}
+
+    def weights():
+        try:
+            assert current["state"] == "actor"
+            yield 1
+        finally:
+            assert current["state"] == "actor"
+
+    iterator = transformer_impl._iter_with_engine_parallel_state(actor, weights())
+    assert next(iterator) == 1
+    assert current["state"] == "outside"
+    iterator.close()
+    assert current == {"state": "outside", "sp": "outside-sp"}
 
 
 @pytest.mark.parametrize("enable_full_shard", [False, True])

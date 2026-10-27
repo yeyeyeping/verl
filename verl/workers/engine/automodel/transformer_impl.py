@@ -430,6 +430,8 @@ class AutomodelEngine(BaseEngine):
         def param_generator():
             for name, param in params.items():
                 unsharded_tensor = param.full_tensor() if isinstance(param, DTensor) else param
+                if unsharded_tensor.device.type == "npu":
+                    unsharded_tensor = unsharded_tensor.to("cpu", non_blocking=False)
                 yield name, unsharded_tensor
 
         return param_generator(), None

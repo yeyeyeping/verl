@@ -20,6 +20,10 @@ from verl.utils.device import get_device_id, get_torch_device
 from verl.workers.engine.utils import _prodshape
 
 VL_TYPE2INDEX = {
+    "minimax_m3_vl": {
+        "IMAGE_INPUT_INDEX": 200025,
+        "VIDEO_INPUT_INDEX": 200026,
+    },
     "qwen2_5_vl": {
         "IMAGE_INPUT_INDEX": 151655,
         "VIDEO_INPUT_INDEX": 151656,
@@ -98,7 +102,7 @@ def offload_veomni_optimizer(optimizer):
                 state = opt.state[param]
                 for key, value in state.items():
                     if isinstance(value, torch.Tensor):
-                        state[key] = value.to("cpu", non_blocking=True)
+                        state[key] = value.to("cpu", non_blocking=False)
 
 
 @torch.no_grad()

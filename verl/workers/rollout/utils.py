@@ -114,6 +114,61 @@ def qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
         return prompt_ids
 
 
+def is_m3_processor(processor) -> bool:
+    return processor is not None and (
+        processor.__class__.__name__ == "MiniMaxM3VLProcessor"
+        or getattr(getattr(processor, "config", None), "model_type", None) == "minimax_m3_vl"
+    )
+
+
+def m3_collapse_image_tokens(prompt_ids: list[int], processor, image_count: int) -> list[int]:
+    """Replace each HF-expanded image, including its boundaries, with one placeholder.
+
+    Bare placeholders are also accepted, but adjacent images remain distinct.
+    Expanded videos need frame/timestamp metadata to undo processing, so refuse
+    them rather than silently treating every frame as a separate video.
+    """
+    image = processor.image_token_id
+    start = processor.vision_start_token_id
+    end = processor.vision_end_token_id
+    if None in (image, start, end) or len({image, start, end}) != 3:
+        raise ValueError("M3 processor must expose distinct image and vision boundary token IDs")
+    collapsed, count, i = [], 0, 0
+    while i < len(prompt_ids):
+        token = prompt_ids[i]
+        if token == start:
+            j = i + 1
+            while j < len(prompt_ids) and prompt_ids[j] == image:
+                j += 1
+            if j == i + 1 or j == len(prompt_ids) or prompt_ids[j] != end:
+                raise ValueError(f"M3 vision block at token {i} is malformed or contains an expanded video")
+            collapsed.append(image)
+            count += 1
+            i = j + 1
+        elif token == end:
+            raise ValueError(f"M3 unmatched vision end token at {i}")
+        else:
+            collapsed.append(token)
+            count += token == image
+            i += 1
+    if count != image_count:
+        raise ValueError(f"M3 prompt has {count} image placeholders but received {image_count} images")
+    return collapsed
+
+
+def validate_m3_prompt_alignment(expected: list[int], actual: list[int] | None):
+    if actual is None or expected != list(actual):
+        actual = [] if actual is None else list(actual)
+        first = next(
+            (i for i, pair in enumerate(zip(expected, actual, strict=False)) if pair[0] != pair[1]),
+            min(len(expected), len(actual)),
+        )
+        raise ValueError(
+            f"M3 training/vLLM prompt mismatch at token {first}: lengths {len(expected)} vs {len(actual)}. "
+            "Check vision expansion, image preprocessing, and prompt boundaries before using rollout logprobs."
+        )
+
+
 def get_vision_placeholder_token_ids(processor) -> list[int]:
     """Vision placeholder token ids the policy must never sample.
 

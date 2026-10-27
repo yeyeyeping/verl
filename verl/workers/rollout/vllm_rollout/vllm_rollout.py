@@ -37,7 +37,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
-from verl.utils.device import is_support_ipc
+from verl.utils.device import get_device_name, is_support_ipc
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
@@ -140,7 +140,7 @@ class ServerAdapter(BaseRollout):
         job_id = ray.get_runtime_context().get_job_id()
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
 
-        self.use_shm = not is_support_ipc()
+        self.use_shm = get_device_name() == "npu" or not is_support_ipc()
         self._delta_weight_transfer_engine_initialized = False
         if self.use_shm:
             logger.warning(

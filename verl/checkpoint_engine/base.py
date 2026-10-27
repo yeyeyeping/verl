@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -418,6 +419,16 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.actor_wg = actor_wg
         self.replicas = replicas
+        self.update_weights_interval = int(os.getenv("VERL_UPDATE_WEIGHTS_INTERVAL", "1"))
+        if self.update_weights_interval < 1:
+            raise ValueError("VERL_UPDATE_WEIGHTS_INTERVAL must be a positive integer")
+        if self.update_weights_interval > 1:
+            from verl.utils.device import get_device_name
+
+            if get_device_name() != "npu" or any(r.config.name != "vllm" for r in replicas):
+                raise ValueError("Skipping weight sync currently requires NPU vLLM level-1 sleep")
+        self._weights_initialized = False
+        self._last_weight_step = None
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for actor worker group and rollout replicas."""
@@ -453,6 +464,7 @@ class CheckpointEngineManager:
             replicas: The list of rollout replicas to add.
         """
         self.replicas.extend(replicas)
+        self._weights_initialized = False  # New dummy engines require an unconditional seed sync.
 
     def remove_replicas(self, replicas: list[RolloutReplica]):
         """Remove rollout replicas from the manager for elastic scale down, will rebuild process group.
@@ -514,9 +526,21 @@ class CheckpointEngineManager:
             global_steps: The global steps of the actor worker group.
         """
 
+        if self._weights_initialized and global_steps is not None and global_steps % self.update_weights_interval != 0:
+            # NPU vLLM level-1 sleep preserves the previous weights on CPU.
+            # Keep their original global_steps version; do not label them as new.
+            await self.wake_up_replicas()
+            await self.resume_generation_replicas()
+            metrics = {"weight_sync/skipped": 1}
+            if self._last_weight_step is not None:
+                metrics["weight_sync/weight_step"] = self._last_weight_step
+            return metrics
+
         # 0. update weights for sync training with colocated actor and rollout
         if self.backend == "naive":
             ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
+            self._weights_initialized = True
+            self._last_weight_step = global_steps
             return {}
 
         # 1. abort and save all unfinished requests for partial rollout
@@ -559,6 +583,8 @@ class CheckpointEngineManager:
         # 8. resume all unfinished requests for partial rollout
         await self.resume_generation_replicas()
 
+        self._weights_initialized = True
+        self._last_weight_step = global_steps
         return sync_metrics
 
 

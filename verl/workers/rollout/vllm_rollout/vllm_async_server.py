@@ -59,8 +59,11 @@ from verl.workers.rollout.utils import (
     extract_response_topk_logprobs_with_coverage,
     get_max_position_embeddings,
     get_vision_placeholder_token_ids,
+    is_m3_processor,
+    m3_collapse_image_tokens,
     qwen2_5_vl_dedup_image_tokens,
     run_uvicorn,
+    validate_m3_prompt_alignment,
     validate_topk_logprob_request,
     warn_topk_logprob_budget,
 )
@@ -221,11 +224,12 @@ class vLLMHttpServer:
         # used for data parallel: --data-parallel-address, --data-parallel-rpc-port
         if self.node_rank == 0:
             self._master_address = self._server_address
+            bind_address = "::" if is_valid_ipv6_address(self._server_address) else "0.0.0.0"
             # used for torch.distributed.init_process_group
-            self._master_port, self._master_sock = get_free_port(self._server_address, with_alive_sock=True)
+            self._master_port, self._master_sock = get_free_port(bind_address, with_alive_sock=True)
             # used for data parallel: --data-parallel-address, --data-parallel-rpc-port
-            self._dp_rpc_port, self._dp_rpc_sock = get_free_port(self._server_address, with_alive_sock=True)
-            self._dp_master_port, self._dp_master_sock = get_free_port(self._server_address, with_alive_sock=True)
+            self._dp_rpc_port, self._dp_rpc_sock = get_free_port(bind_address, with_alive_sock=True)
+            self._dp_master_port, self._dp_master_sock = get_free_port(bind_address, with_alive_sock=True)
         else:
             self._master_address = None
             self._master_port = None
@@ -412,10 +416,11 @@ class vLLMHttpServer:
             dp_args = {
                 "data_parallel_size": self.config.data_parallel_size,
                 "data_parallel_size_local": data_parallel_size_local,
-                "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
                 "data_parallel_address": self._master_address,
                 "data_parallel_rpc_port": self._dp_rpc_port,
             }
+            if self.node_rank != 0:
+                dp_args["data_parallel_start_rank"] = self.node_rank * data_parallel_size_local
             args.update(dp_args)
 
         args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})
@@ -497,7 +502,15 @@ class vLLMHttpServer:
         else:
             await self.run_headless(server_args)
 
+    def _release_reserved_ports(self):
+        for name in ("_master_sock", "_dp_rpc_sock", "_dp_master_sock"):
+            sock = getattr(self, name, None)
+            if sock is not None:
+                sock.close()
+                setattr(self, name, None)
+
     async def run_server(self, args: argparse.Namespace):
+        self._release_reserved_ports()
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
@@ -553,6 +566,7 @@ class vLLMHttpServer:
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
+        self._release_reserved_ports()
         args.api_server_count = 0
 
         def run_headless_wrapper():
@@ -672,7 +686,12 @@ class vLLMHttpServer:
         budget_warnings = getattr(self, "_topk_budget_warnings", set())
         warn_topk_logprob_budget(sampling_params, budget_warnings)
         self._topk_budget_warnings = budget_warnings
-        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        training_prompt_ids = list(prompt_ids)
+        m3_prompt = is_m3_processor(self.model_config.processor)
+        if m3_prompt:
+            prompt_ids = m3_collapse_image_tokens(prompt_ids, self.model_config.processor, len(image_data or []))
+        else:
+            prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
             multi_modal_data["image"] = image_data
@@ -743,6 +762,9 @@ class vLLMHttpServer:
                 extra_fields=extra_fields,
             )
             return self._postprocess_output(aborted, final_res, sampling_params)
+
+        if m3_prompt:
+            validate_m3_prompt_alignment(training_prompt_ids, final_res.prompt_token_ids)
 
         # Prefix-cache hit count for this request; consumers surface it as
         # OpenAI usage.prompt_tokens_details.cached_tokens.

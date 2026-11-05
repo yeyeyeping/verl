@@ -492,9 +492,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 log_only_rank_0=True,
             )
 
-            # If we have a custom model, we copy the file defining it in the folder and set the attributes so it can be
-            # loaded from the Hub.
-            if hasattr(model_config, "auto_map"):
+            # Config/processor-only auto_map entries do not make the training model remote code.
+            # Their save_pretrained methods already copy their own custom source files.
+            # Only model auto classes require packaging the model implementation.
+            if any(key.startswith("AutoModel") for key in getattr(model_config, "auto_map", {})):
                 # custom_object_save copies the source of type(obj).__module__, so it needs the base
                 # model's module. For a PEFT model unwrap_model is the PeftModel wrapper, so unwrap it
                 # first; get_base_model() is peft-only (a plain model lacks it and is passed through).

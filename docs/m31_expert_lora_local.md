@@ -90,3 +90,16 @@ under `/mnt/share/l00991686/outputs/m31_single_expert_lora_<timestamp>/`.
   they are not added to CI in this local integration.
 
 Logs: `/mnt/share/l00991686/work/m31_expert_lora_20261105/`.
+
+## Checkpoint metadata integration fix
+
+The eight-NPU run `m31_single8_expert_lora_20261105_173116` completed
+initial refit/validation and the first actor update. Its checkpoint tensor
+shards were saved, but metadata export failed while trying to copy the
+VeOmni generated model's `..parallel_plan` import as `.parallel_plan.py`.
+The checkpoint config declares only `AutoConfig` in `auto_map`. The FSDP
+manager now packages model source only for `AutoModel*` entries; config and
+processor `save_pretrained` still save their own custom code normally.
+The checkpoint CPU module passes all 20 tests, including config-only and
+actual remote-model cases, with and without a model wrapper. The failed
+checkpoint is retained as an incomplete artifact; the retry starts fresh.

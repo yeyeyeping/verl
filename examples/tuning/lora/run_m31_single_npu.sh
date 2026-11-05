@@ -86,7 +86,7 @@ if not p.exists():
     p.chmod(0o600)
 PY
     exec ray start --head --port="$RAY_PORT" --node-ip-address="$LOCAL_IP" \
-        --num-gpus=0 --num-cpus=32 --object-store-memory=8589934592 \
+        --num-gpus=0 --num-cpus="${RAY_NUM_CPUS:-64}" --object-store-memory=8589934592 \
         "--resources={\"NPU\":$NPU_COUNT}" --include-dashboard=false \
         --dashboard-agent-listen-port=0 --disable-usage-stats
 fi

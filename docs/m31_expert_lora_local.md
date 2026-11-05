@@ -57,7 +57,9 @@ bash /mnt/share/l00991686/run_m31_single_expert_lora.sh train
 
 `check` is the default and only checks files/config. `print` prints argv;
 neither starts Ray or training. The head uses a dedicated port (30741) and
-refuses to start while another raylet exists. No script stops existing jobs.
+refuses to start while another raylet exists. It advertises 64 CPUs by default
+(`RAY_NUM_CPUS` override): the eight-worker placement group needs 24 CPUs
+in addition to the driver and storage actors; 32 total cannot schedule it. No script stops existing jobs.
 To compare shared adapters, use `MOE_LORA_MODE=shared ... train`.
 Set `TOTAL_STEPS`, `RESPONSE_LENGTH`, `SAVE_FREQ`, `RUN_DIR` as needed.
 ASCEND_RT_VISIBLE_DEVICES accepts four or eight distinct devices and must
@@ -81,9 +83,9 @@ under `/mnt/share/l00991686/outputs/m31_single_expert_lora_<timestamp>/`.
   the generic MoE binding, so the bridge now binds its requested LoRA backend
   explicitly. NPU tests exercise the wrapper dispatch instead of calling the
   kernel directly. The post-fix CPU tests report 7 passed, 2 NPU cases
-  skipped; ruff and both launcher topologies pass checks. Full training
-  validation remains pending: a separate GLM5.3/Slime run started on 2241
-  at 17:07 and occupies all eight NPUs. It has not been stopped.
+  skipped at the time; after resources were released, both NPU wrapper
+  forward/backward tests passed on 2241. Ruff and both launcher topologies
+  pass checks. Full training validation remains in progress.
 - The standalone distributed scripts are explicit local regression commands;
   they are not added to CI in this local integration.
 

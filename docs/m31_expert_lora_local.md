@@ -103,3 +103,27 @@ processor `save_pretrained` still save their own custom code normally.
 The checkpoint CPU module passes all 20 tests, including config-only and
 actual remote-model cases, with and without a model wrapper. The failed
 checkpoint is retained as an incomplete artifact; the retry starts fresh.
+
+
+## LoRA storage precision
+
+New M3 LoRA engine builds call `prepare_m3_lora_dtypes` before FSDP/weight loading:
+frozen parameters use BF16, adapters and router weights use FP32, and
+`e_score_correction_bias` remains FP32 (buffer or parameter). Routers stay frozen.
+Other buffers retain their existing dtype. The bridge enables VeOmni's opt-in
+`preserve_frozen_dtype` and requires mixed precision. Router module types join the
+existing FSDP mixed-precision exclusion list so their forward also stays FP32;
+adapter master weights/optimizer states are FP32 with BF16 mixed-precision compute.
+Existing running processes keep their already-loaded implementation; restart is
+required for this policy to apply. No checkpoint or active job is modified.
+
+
+Precision-policy validation (2026-11-05): 60 CPU regression cases passed, two
+hardware opt-in cases skipped. The two-rank CPU/Gloo FSDP2 probe passed for both
+shared and independent adapters: all six expert adapter tensors had nonzero
+FP32 gradients and changed after AdamW; frozen BF16 parameters were unchanged;
+router forward and AdamW moments were FP32. Reproduce with
+`torchrun --standalone --nproc-per-node=2 tests/workers/test_m3_lora_dtype_fsdp.py`
+from the verl checkout. This is a local distributed regression script, not a CI
+test. Full NPU training with the new precision policy is still to be validated;
+the ongoing main-thread experiment was neither restarted nor modified.

@@ -179,3 +179,86 @@ def test_npu_forward_backward(mode, monkeypatch):
     b = torch.autograd.grad(ref.float().sum(), parameters)
     for ga, gb in zip(a, b, strict=True):
         torch.testing.assert_close(ga, gb, atol=0.15, rtol=0.1)
+
+
+class DtypeRouter(nn.Module):
+    def __init__(self, parameter_bias=False):
+        super().__init__()
+        self.weight = nn.Parameter(torch.full((4, 8), 0.123456))
+        bias = torch.full((4,), 0.123456)
+        if parameter_bias:
+            self.e_score_correction_bias = nn.Parameter(bias, requires_grad=False)
+        else:
+            self.register_buffer("e_score_correction_bias", bias)
+
+    def forward(self, x):
+        return F.linear(x.to(self.weight.dtype), self.weight) + self.e_score_correction_bias
+
+
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+@pytest.mark.parametrize("parameter_bias", [False, True])
+def test_m3_storage_precision(mode, device, parameter_bias):
+    from verl.workers.engine.veomni.m3_lora import prepare_m3_lora_dtypes
+
+    with torch.device(device):
+        toy = ToyM3()
+        toy.model.language_model.layers[0].mlp.gate = DtypeRouter(parameter_bias)
+        toy.register_buffer("indices", torch.arange(4))
+        toy.register_buffer("rotary", torch.ones(4, dtype=torch.float32))
+    model = wrap_m3_lora(toy, 4, 7, "all-linear", moe_mode=mode)
+    model.get_ignore_modules_in_mixed_precision = lambda: (nn.LayerNorm,)
+    before = {n: (id(p), p.requires_grad, p.detach().clone()) for n, p in model.named_parameters()}
+    prepare_m3_lora_dtypes(model)
+    prepare_m3_lora_dtypes(model)  # Idempotent and keeps pre-existing exclusions.
+    assert model.get_ignore_modules_in_mixed_precision() == (nn.LayerNorm, DtypeRouter)
+    for name, p in model.named_parameters():
+        identity, trainable, value = before[name]
+        assert id(p) == identity and p.requires_grad == trainable
+        fp32 = trainable or name.endswith(".mlp.gate.weight") or name.endswith(".e_score_correction_bias")
+        assert p.dtype == (torch.float32 if fp32 else torch.bfloat16), name
+        if device == "cpu":
+            torch.testing.assert_close(p, value.to(p.dtype), rtol=0, atol=0)
+    for name, buffer in model.named_buffers():
+        if name.endswith("e_score_correction_bias") or name.endswith("rotary"):
+            assert buffer.dtype == torch.float32
+        if name.endswith("indices"):
+            assert buffer.dtype == torch.int64
+
+
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+def test_mixed_storage_merge_and_gradients(mode):
+    from verl.workers.engine.veomni.m3_lora import prepare_m3_lora_dtypes
+
+    torch.manual_seed(123)
+    model = wrap_m3_lora(ToyM3(), 4, 7, "all-linear", moe_mode=mode)
+    prepare_m3_lora_dtypes(model)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if ".lora_B." in name:
+                p.normal_(0, 0.03)
+    before = {n: t.detach().clone() for n, t in model.state_dict().items()}
+    merged = dict(merged_m3_lora_weights(model, model.state_dict(), "cpu").items())
+    expert = next(m for m in model.modules() if isinstance(m, (LoraSharedExperts, LoraIndependentExperts)))
+    x = torch.randn(16, 8, dtype=torch.bfloat16, requires_grad=True)
+    ids = torch.arange(16).remainder(4).reshape(-1, 1)
+    weights = torch.ones(16, 1, dtype=torch.bfloat16)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        expert._eager_forward(x, ids, weights).float().square().mean().backward()
+    for name, p in expert.named_parameters():
+        if p.requires_grad:
+            assert p.dtype == p.grad.dtype == torch.float32
+            assert torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0, name
+        else:
+            assert p.dtype == torch.bfloat16 and p.grad is None
+    root = "model.language_model.layers.0.mlp.experts"
+    for projection, specs in (("gate_up_proj", ("gate_proj", "up_proj")), ("down_proj", ("down_proj",))):
+        base = getattr(expert, projection).base_layer.weight.detach().float()
+        updates = []
+        for spec in specs:
+            a, b = expert.get_lora_A_weight(spec), expert.get_lora_B_weight(spec)
+            updates.append(b @ a * expert._lora_scale_value)
+        delta = torch.cat(updates, dim=-2) if len(updates) > 1 else updates[0]
+        torch.testing.assert_close(merged[f"{root}.{projection}"], (base + delta).bfloat16(), rtol=0, atol=0)
+    for name, t in model.state_dict().items():
+        torch.testing.assert_close(t, before[name], rtol=0, atol=0)

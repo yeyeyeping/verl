@@ -9,6 +9,7 @@ import logging
 import re
 from contextlib import contextmanager
 from datetime import timedelta
+from types import MethodType
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -55,6 +56,45 @@ def isolated_weight_metadata():
     finally:
         module_utils.dist = dist
         dist.destroy_process_group(group)
+
+
+def _m3_lora_fp32_modules(self):
+    return self._m3_lora_fp32_module_types
+
+
+def prepare_m3_lora_dtypes(model):
+    """Set storage dtypes before FSDP and keep router computation in FP32.
+
+    Call after LoRA injection on the FP32/meta model, before loading weights.
+    Pair with preserve_frozen_dtype=True so parallelization retains this policy.
+    Only adapters remain trainable; this function does not unfreeze routers.
+    """
+    for name, parameter in model.named_parameters():
+        if not parameter.is_floating_point():
+            continue
+        fp32 = (
+            parameter.requires_grad
+            or name == "mlp.gate.weight"
+            or name.endswith(".mlp.gate.weight")
+            or name.split(".")[-1] == "e_score_correction_bias"
+        )
+        dtype = torch.float32 if fp32 else torch.bfloat16
+        parameter.data = parameter.data.to(dtype)
+        if parameter.grad is not None:
+            parameter.grad.data = parameter.grad.data.to(dtype)
+    for name, buffer in model.named_buffers():
+        if name.split(".")[-1] == "e_score_correction_bias" and buffer.is_floating_point():
+            buffer.data = buffer.data.float()
+    # Reuse VeOmni's existing per-module FP32 FSDP policy, preserving any
+    # model-provided exceptions. Never wrap the router as a LoRA target.
+    existing = getattr(model, "get_ignore_modules_in_mixed_precision", None)
+    ignored = tuple(existing()) if existing is not None else ()
+    routers = tuple(
+        type(module) for name, module in model.named_modules() if name == "mlp.gate" or name.endswith(".mlp.gate")
+    )
+    model._m3_lora_fp32_module_types = tuple(dict.fromkeys((*ignored, *routers)))
+    model.get_ignore_modules_in_mixed_precision = MethodType(_m3_lora_fp32_modules, model)
+    LOG.warning("M3_LORA dtype policy: frozen=BF16 trainable/router/correction_bias=FP32")
 
 
 def wrap_m3_lora(
@@ -256,6 +296,8 @@ def install():
             raise ValueError("M3 LoRA requires model.lora.merge=True for ordinary vLLM weight sync")
         ops = impl._build_ops_implementation_config(self.engine_config)
         mp = impl.MixedPrecisionConfig(enable=self.engine_config.mixed_precision)
+        if not mp.enable:
+            raise ValueError("M3 LoRA dtype policy requires mixed_precision=True")
         module = impl.build_foundation_model(
             config_path=self._get_model_config_path(),
             weights_path=self.model_config.local_path,
@@ -273,6 +315,7 @@ def install():
             self.model_config.lora.get("moe_mode", "independent"),
             moe_implementation=self.engine_config.moe_implementation,
         )
+        prepare_m3_lora_dtypes(module)
         self._maybe_apply_async_activation_offload(module)
         with isolated_weight_metadata():
             module = impl.build_parallelize_model(
@@ -280,6 +323,7 @@ def install():
                 init_device=self.engine_config.init_device,
                 weights_path=self.model_config.local_path,
                 is_peft_model=True,
+                preserve_frozen_dtype=True,
                 enable_reshard_after_forward=self.engine_config.enable_full_shard,
                 mixed_precision=mp,
                 low_precision_reduce_scatter_comm=self.engine_config.low_precision_reduce_scatter_comm,

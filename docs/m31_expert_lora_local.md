@@ -36,10 +36,11 @@ single-device NPU forward/backward tests. Distributed export: torchrun
 Host: ssh 2241. Model:
 `/mnt/share/y00977881/weight/MiniMax-M3.1-Flash-BF16-MoE4-4Layers-1P`.
 This is four text layers, three dense MLP layers and one routed MoE layer,
-with four routed experts. The single-node launcher uses four NPUs (0,1,2,3),
-FSDP4/EP4 actor and TP4/DP1/EP4 rollout. It defaults to independent rank64,
+with four routed experts. The single-node launcher defaults to all eight NPUs
+(0 through 7), FSDP8/EP4 actor (expert FSDP2) and two independent
+TP4/DP1/EP4 rollout replicas. It defaults to independent rank64,
 alpha64, all text linear targets plus experts, merged weight sync, three
-steps, batch4 with n=2, max response1024 and checkpoint/validation every step.
+steps, batch8 with n=2, max response1024 and checkpoint/validation every step.
 Rollout uses eager execution for initial validation. This is a correctness
 smoke test with shared train/validation data, not a quality benchmark.
 
@@ -59,8 +60,10 @@ neither starts Ray or training. The head uses a dedicated port (30741) and
 refuses to start while another raylet exists. No script stops existing jobs.
 To compare shared adapters, use `MOE_LORA_MODE=shared ... train`.
 Set `TOTAL_STEPS`, `RESPONSE_LENGTH`, `SAVE_FREQ`, `RUN_DIR` as needed.
-Exactly four visible NPUs are required; ASCEND_RT_VISIBLE_DEVICES can select
-another set of four, but must be identical for head and train.
+ASCEND_RT_VISIBLE_DEVICES accepts four or eight distinct devices and must
+be identical for head and train. Four devices select FSDP4/EP4, one rollout
+replica and batch4; eight select FSDP8/EP4, two replicas and batch8. EP remains
+4 because this checkpoint has only four experts.
 Logs, launcher snapshot, source revision/patches and exit_code are saved
 under `/mnt/share/l00991686/outputs/m31_single_expert_lora_<timestamp>/`.
 
@@ -72,7 +75,15 @@ under `/mnt/share/l00991686/outputs/m31_single_expert_lora_<timestamp>/`.
 - CPU Gloo/DTensor EP2 and EP2 x FSDP2 export: both modes match the
   unsharded public-layout reference exactly.
 - VeOmni make quality, touched verl ruff checks, bash syntax and model/shard
-  preflight passed. No RL training or actual vLLM refit has been run yet.
+  preflight passed. The first four-NPU run completed initial merged vLLM
+  refit and 36 validation requests, then exposed missing LoRA kernel binding
+  on its first training forward. M3 uses a non-standard OpSlot that skips
+  the generic MoE binding, so the bridge now binds its requested LoRA backend
+  explicitly. NPU tests exercise the wrapper dispatch instead of calling the
+  kernel directly. The post-fix CPU tests report 7 passed, 2 NPU cases
+  skipped; ruff and both launcher topologies pass checks. Full training
+  validation remains pending: a separate GLM5.3/Slime run started on 2241
+  at 17:07 and occupies all eight NPUs. It has not been stopped.
 - The standalone distributed scripts are explicit local regression commands;
   they are not added to CI in this local integration.
 

@@ -57,7 +57,9 @@ def isolated_weight_metadata():
         dist.destroy_process_group(group)
 
 
-def wrap_m3_lora(model, rank, alpha, target_modules=None, target_parameters=None, moe_mode="independent"):
+def wrap_m3_lora(
+    model, rank, alpha, target_modules=None, target_parameters=None, moe_mode="independent", moe_implementation="eager"
+):
     """Configure M3 text LoRA; all-linear includes dense, shared and routed experts."""
     if getattr(model.config, "model_type", None) != "minimax_m3_vl":
         raise ValueError("M3 LoRA is restricted to minimax_m3_vl")
@@ -106,6 +108,15 @@ def wrap_m3_lora(model, rank, alpha, target_modules=None, target_parameters=None
     expert_count = sum(isinstance(m, EXPERT_TYPES) for m in wrapped.modules())
     if expert_targets and not expert_count:
         raise RuntimeError("Expert LoRA requested but no experts were wrapped")
+    if expert_count:
+        if moe_implementation not in ("eager", "fused_npu"):
+            raise ValueError("M3 expert LoRA supports only eager or fused_npu")
+        # M3's non-standard OpSlot skips the generic MoE patch that normally
+        # binds these pointers. Bind explicitly before the first EP forward.
+        from veomni.lora.ops import bind_lora_moe_kernels
+
+        bind_lora_moe_kernels(moe_implementation.removeprefix("fused_"))
+        LOG.warning("M3_LORA expert kernel backend=%s", moe_implementation)
     LOG.warning(
         "M3_LORA dense_targets=%d expert_layers=%d mode=%s rank=%d alpha=%d trainable=%d",
         len(targets),
@@ -260,6 +271,7 @@ def install():
             self.model_config.target_modules,
             self.model_config.target_parameters,
             self.model_config.lora.get("moe_mode", "independent"),
+            moe_implementation=self.engine_config.moe_implementation,
         )
         self._maybe_apply_async_activation_offload(module)
         with isolated_weight_metadata():

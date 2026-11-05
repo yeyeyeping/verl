@@ -10,7 +10,9 @@ PROJECT="$ROOT/project/veomni_verl_vllm3.1flash"
 ENV_DIR=/mnt/share/y00977881/env/veomni-verl-vllm31flash
 export MODEL_PATH=${MODEL_PATH:-/mnt/share/y00977881/weight/MiniMax-M3.1-Flash-BF16-MoE4-4Layers-1P}
 export DATA_FILE=${DATA_FILE:-$PROJECT/data/geometry3k-test-verl-balanced36-val0-20261105_004425.parquet}
-export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}
+export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+IFS=',' read -r -a NPU_DEVICES <<< "$ASCEND_RT_VISIBLE_DEVICES"
+export NPU_COUNT=${#NPU_DEVICES[@]}
 export SOCKET_IFNAME=${SOCKET_IFNAME:-data0.172}
 LOCAL_IP=$(ip -o -4 addr show dev "$SOCKET_IFNAME" | awk '{split($4,a,"/"); print a[1]; exit}')
 [[ -n "$LOCAL_IP" ]] || { echo "No IPv4 on $SOCKET_IFNAME" >&2; exit 2; }
@@ -32,7 +34,7 @@ p=Path(os.environ['MODEL_PATH'])
 c=json.loads((p/'config.json').read_text())['text_config']
 assert c['num_hidden_layers']==4 and c['num_local_experts']==4, 'Expected the specified 4-layer / 4-expert checkpoint'
 devices=os.environ['ASCEND_RT_VISIBLE_DEVICES'].split(',')
-assert len(devices)==4 and len(set(devices))==4, 'This topology requires exactly four distinct visible NPUs'
+assert len(devices) in (4, 8) and len(set(devices))==len(devices), 'Select four or eight distinct visible NPUs'
 index=json.loads((p/'model.safetensors.index.json').read_text())
 for file in set(index['weight_map'].values()):
     assert (p/file).is_file(), f'Missing weight shard: {file}'
@@ -40,7 +42,7 @@ for file in ('tokenizer.json','tokenizer_config.json','preprocessor_config.json'
     assert (p/file).is_file(), f'Missing model asset: {file}'
 assert Path(os.environ['DATA_FILE']).is_file(), 'Missing validation data'
 print(f"MODEL_OK layers={c['num_hidden_layers']} experts={c['num_local_experts']} moe_layers={sum(c['moe_layer_freq'])}")
-print('TOPOLOGY single node; 4 NPUs; train FSDP4/EP4; rollout TP4/DP1/EP4')
+print(f'TOPOLOGY single node; {len(devices)} NPUs; train FSDP{len(devices)}/EP4; rollout {len(devices)//4} replicas of TP4/DP1/EP4')
 print('VISIBLE_NPUS='+','.join(devices))
 PY
 }
@@ -85,7 +87,7 @@ if not p.exists():
 PY
     exec ray start --head --port="$RAY_PORT" --node-ip-address="$LOCAL_IP" \
         --num-gpus=0 --num-cpus=32 --object-store-memory=8589934592 \
-        '--resources={"NPU":4}' --include-dashboard=false \
+        "--resources={\"NPU\":$NPU_COUNT}" --include-dashboard=false \
         --dashboard-agent-listen-port=0 --disable-usage-stats
 fi
 
@@ -95,7 +97,7 @@ CMD=(python -m verl.trainer.main_ppo
     algorithm.use_kl_in_reward=False
     "data.train_files=$DATA_FILE"
     "data.val_files=$DATA_FILE"
-    data.train_batch_size=4
+    "data.train_batch_size=$NPU_COUNT"
     data.max_prompt_length=2048
     "data.max_response_length=$RESPONSE_LENGTH"
     data.filter_overlong_prompts=True
@@ -121,14 +123,14 @@ CMD=(python -m verl.trainer.main_ppo
     actor_rollout_ref.actor.optim.lr_scheduler_type=constant
     actor_rollout_ref.actor.optim.lr_warmup_steps=0
     actor_rollout_ref.actor.ppo_epochs=1
-    actor_rollout_ref.actor.ppo_mini_batch_size=4
+    "actor_rollout_ref.actor.ppo_mini_batch_size=$NPU_COUNT"
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
     actor_rollout_ref.actor.use_dynamic_bsz=True
     "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$MAX_MODEL_LEN"
     actor_rollout_ref.actor.use_kl_loss=False
     actor_rollout_ref.actor.entropy_coeff=0
     actor_rollout_ref.actor.use_torch_compile=False
-    actor_rollout_ref.actor.veomni.fsdp_size=4
+    "actor_rollout_ref.actor.veomni.fsdp_size=$NPU_COUNT"
     actor_rollout_ref.actor.veomni.ulysses_parallel_size=1
     actor_rollout_ref.actor.veomni.expert_parallel_size=4
     actor_rollout_ref.actor.veomni.moe_implementation=fused_npu
@@ -155,7 +157,7 @@ CMD=(python -m verl.trainer.main_ppo
     actor_rollout_ref.rollout.max_num_batched_tokens=4096
     actor_rollout_ref.rollout.max_num_seqs=4
     actor_rollout_ref.rollout.disable_log_stats=False
-    actor_rollout_ref.rollout.agent.num_workers=4
+    "actor_rollout_ref.rollout.agent.num_workers=$NPU_COUNT"
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$MAX_MODEL_LEN"
@@ -174,7 +176,7 @@ CMD=(python -m verl.trainer.main_ppo
     ++actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.weight_nz_mode=0
     ++actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.enable_cpu_binding=False
     trainer.device=npu
-    trainer.n_gpus_per_node=4
+    "trainer.n_gpus_per_node=$NPU_COUNT"
     trainer.nnodes=1
     trainer.logger=console
     trainer.project_name=m31_lora_rl

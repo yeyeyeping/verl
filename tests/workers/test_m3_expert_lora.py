@@ -134,16 +134,36 @@ def test_bad_targets_rejected():
 
 
 @pytest.mark.parametrize("mode", ["shared", "independent"])
-def test_npu_forward_backward(mode):
+def test_expert_backend_binding(monkeypatch, mode):
+    from veomni.lora import ops
+
+    calls = []
+    monkeypatch.setattr(ops, "bind_lora_moe_kernels", calls.append)
+    wrap_m3_lora(ToyM3(), 4, 4, "all-linear", moe_mode=mode, moe_implementation="fused_npu")
+    assert calls == ["npu"]
+    wrap_m3_lora(ToyM3(), 4, 4, "all-linear", moe_mode=mode)
+    assert calls == ["npu", "eager"]
+    wrap_m3_lora(ToyM3(), 4, 4, ["q_proj"], moe_mode=mode, moe_implementation="fused_npu")
+    assert calls == ["npu", "eager"]
+    with pytest.raises(ValueError, match="only eager or fused_npu"):
+        wrap_m3_lora(ToyM3(), 4, 4, "all-linear", moe_mode=mode, moe_implementation="fused_triton")
+
+
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+def test_npu_forward_backward(mode, monkeypatch):
     """Run only when explicitly requested, to avoid using a busy training NPU."""
     import os
 
     if os.environ.get("M31_TEST_NPU") != "1":
         pytest.skip("Set M31_TEST_NPU=1 on a free device")
-    from veomni.lora.ops.npu_moe_group_gemm import _npu_fused_lora_moe_forward
+    from veomni.lora import ops
 
-    cls = LoraSharedExperts if mode == "shared" else LoraIndependentExperts
-    m = cls(Experts(), r=4, lora_alpha=7).to("npu", dtype=torch.bfloat16)
+    # Exercise the production wrapper and its dispatch, starting unbound.
+    monkeypatch.setattr(ops, "_fused_lora_moe_forward", None)
+    monkeypatch.setattr(ops, "_fused_independent_lora_moe_forward", None)
+    wrapped = wrap_m3_lora(ToyM3(), 4, 7, "all-linear", moe_mode=mode, moe_implementation="fused_npu")
+    m = next(m for m in wrapped.modules() if isinstance(m, (LoraSharedExperts, LoraIndependentExperts)))
+    m = m.to("npu", dtype=torch.bfloat16)
     for name, p in m.named_parameters():
         if ".lora_B." in name:
             with torch.no_grad():
@@ -151,22 +171,7 @@ def test_npu_forward_backward(mode):
     x = torch.randn(16, 8, device="npu", dtype=torch.bfloat16, requires_grad=True)
     ids = torch.arange(16, device="npu").remainder(4).reshape(-1, 1)
     weights = torch.ones(16, 1, device="npu", dtype=torch.bfloat16)
-    kwargs = dict(
-        num_experts=4,
-        routing_weights=weights,
-        selected_experts=ids,
-        hidden_states=x,
-        fc1_1_2_weight=m.gate_up_proj.base_layer.weight,
-        fc2_weight=m.down_proj.base_layer.weight,
-        independent=mode == "independent",
-        swiglu_alpha=1.702,
-        swiglu_limit=7.0,
-    )
-    for short, spec in (("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")):
-        kwargs["lora_a_" + short] = m.get_lora_A_weight(spec)
-        kwargs["lora_b_" + short] = m.get_lora_B_weight(spec)
-        kwargs["lora_scale_" + short] = m._lora_scale_value
-    y = _npu_fused_lora_moe_forward(**kwargs)
+    y = m(x, ids, weights)
     ref = m._eager_forward(x, ids, weights)
     torch.testing.assert_close(y, ref, atol=0.08, rtol=0.05)
     parameters = [x] + [p for p in m.parameters() if p.requires_grad]

@@ -405,13 +405,15 @@ class vLLMHttpServer:
             )
 
         if self.config.data_parallel_size > 1:
-            assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
-                "gpus_per_node should be divisible by tensor_model_parallel_size"
+            tp_size = self.config.tensor_model_parallel_size
+            assert self.gpus_per_node % tp_size == 0 or tp_size % self.gpus_per_node == 0, (
+                "gpus_per_node and tensor_model_parallel_size must divide one another"
             )
-            data_parallel_size_local = self.gpus_per_node // self.config.tensor_model_parallel_size
-            assert len(self.workers) == data_parallel_size_local * self.config.tensor_model_parallel_size, (
+            data_parallel_size_local = max(1, self.gpus_per_node // tp_size)
+            local_tp_size = min(tp_size, self.gpus_per_node)
+            assert len(self.workers) == data_parallel_size_local * local_tp_size, (
                 f"num workers ({len(self.workers)}) should be equal to "
-                f"dp_size_local ({data_parallel_size_local}) * tp_size ({self.config.tensor_model_parallel_size})"
+                f"dp_size_local ({data_parallel_size_local}) * local_tp_size ({local_tp_size})"
             )
             dp_args = {
                 "data_parallel_size": self.config.data_parallel_size,
@@ -420,7 +422,7 @@ class vLLMHttpServer:
                 "data_parallel_rpc_port": self._dp_rpc_port,
             }
             if self.node_rank != 0:
-                dp_args["data_parallel_start_rank"] = self.node_rank * data_parallel_size_local
+                dp_args["data_parallel_start_rank"] = self.node_rank * self.gpus_per_node // tp_size
             args.update(dp_args)
 
         args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})

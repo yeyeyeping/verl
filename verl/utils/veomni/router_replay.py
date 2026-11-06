@@ -64,9 +64,12 @@ Fire order is only meaningful because of the contract it implies: slot
 ``i`` of a ``routed_experts`` tensor must belong to the ``i``-th router to
 fire. Rollout backends fill that tensor by **absolute decoder-layer
 index** over all ``num_hidden_layers`` (vLLM sizes its capture buffer that
-way and writes at ``extract_layer_index(layer_name)``), so R3 replay is
-only correct when every decoder layer contributes exactly one hooked
-router. A model that hooks a subset -- e.g. DeepSeek-V4, whose first three
+way and writes at ``extract_layer_index(layer_name)``). For MiniMax M3 VL,
+:meth:`select_routing_layers` projects those absolute slots onto the sparse
+FFN layers declared by ``text_config.mlp_layer_types``. R2 recordings already
+contain only fired MoE routers and must not be projected again. Other model
+families still require every decoder slot to contribute one hooked router.
+A model that hooks a subset -- e.g. DeepSeek-V4, whose first three
 layers are hash-routed -- silently shifts every layer's target unless its
 skipped layers are hooked too. :meth:`num_fired` vs :meth:`num_targets`
 lets the engine assert the contract after each forward instead of
@@ -122,6 +125,8 @@ class VeOmniRouterReplay:
         # Env-gated shape sanity check.
         self._debug: bool = os.environ.get("VERL_ROUTER_REPLAY_DEBUG") == "1"
         self._installed: bool = False
+        self._moe_decoder_layers: list[int] | None = None
+        self._num_decoder_layers: int | None = None
 
     @property
     def action(self) -> RouterReplayAction:
@@ -154,8 +159,36 @@ class VeOmniRouterReplay:
         # Fail fast if this model family has not been wired for replay
         # (would otherwise surface as a cryptic mid-forward error).
         validate_model_for_replay(model)
+        self._moe_decoder_layers = None
+        self._num_decoder_layers = None
+        config = getattr(model, "config", None)
+        if config is None and hasattr(model, "module"):
+            config = model.module.config
+        text_config = getattr(config, "text_config", config)
+        if getattr(text_config, "model_type", None) == "minimax_m3_vl_text":
+            self._num_decoder_layers = text_config.num_hidden_layers
+            layer_types = text_config.mlp_layer_types
+            if len(layer_types) != self._num_decoder_layers:
+                raise ValueError("MiniMax replay: mlp_layer_types length differs from decoder depth")
+            self._moe_decoder_layers = [i for i, kind in enumerate(layer_types) if kind == "sparse"]
+            if not self._moe_decoder_layers:
+                raise ValueError("MiniMax replay requires at least one MoE FFN")
         set_active_replay(self)
         self._installed = True
+
+    def select_routing_layers(self, targets: torch.Tensor, *, from_rollout: bool) -> torch.Tensor:
+        """Project R3 absolute decoder slots; R2 recordings are already MoE-only."""
+        if self._moe_decoder_layers is None:
+            return targets
+        expected = self._num_decoder_layers if from_rollout else len(self._moe_decoder_layers)
+        if targets.ndim != 3 or targets.shape[1] != expected:
+            raise RuntimeError(
+                f"MiniMax replay routing shape {tuple(targets.shape)}: expected {expected} layer slots "
+                f"for {'rollout' if from_rollout else 'actor record'} routing"
+            )
+        if from_rollout:
+            return targets[:, self._moe_decoder_layers, :]
+        return targets
 
     def uninstall(self) -> None:
         """Reverse :meth:`install`. Idempotent."""

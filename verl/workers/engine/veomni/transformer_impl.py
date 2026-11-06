@@ -995,6 +995,7 @@ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
 
         # Nested-jagged [bs, seq, L, topk] -> rmpad [total_nnz, L, topk].
         targets = (routed.values() if routed.is_nested else routed).to(torch.int64)
+        targets = rr.select_routing_layers(targets, from_rollout=self._router_replay_mode == "R3")
         pad_size = int(output_args.get("pad_size", 0))
         if pad_size:
             targets = torch.cat([targets, targets.new_zeros((pad_size, *targets.shape[1:]))])

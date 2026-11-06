@@ -39,6 +39,7 @@ What's covered
 """
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -386,3 +387,70 @@ def test_install_without_veomni_raises(ctrl):
         mp.setitem(sys.modules, "veomni.utils.moe_router_replay", None)
         with pytest.raises(RuntimeError, match="VeOmni build"):
             ctrl.install(nn.Linear(1, 1))
+
+
+def test_minimax_dense_prefix_projection():
+    ctrl = VeOmniRouterReplay()
+    ctrl._moe_decoder_layers = list(range(3, 60))
+    ctrl._num_decoder_layers = 60
+    targets = torch.arange(2 * 60 * 4).reshape(2, 60, 4)
+    projected = ctrl.select_routing_layers(targets, from_rollout=True)
+    assert projected.shape == (2, 57, 4)
+    torch.testing.assert_close(projected, targets[:, 3:, :], rtol=0, atol=0)
+    assert ctrl.select_routing_layers(projected, from_rollout=False) is projected
+    with pytest.raises(RuntimeError, match="expected 60 layer slots"):
+        ctrl.select_routing_layers(projected, from_rollout=True)
+    with pytest.raises(RuntimeError, match="expected 57 layer slots"):
+        ctrl.select_routing_layers(targets, from_rollout=False)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_minimax_install_selects_sparse_layers_and_resets(ctrl, wrapped, multimodal):
+    stub, captured = _make_veomni_stub()
+    text_config = SimpleNamespace(
+        model_type="minimax_m3_vl_text",
+        num_hidden_layers=4,
+        mlp_layer_types=["dense", "sparse", "dense", "sparse"],
+    )
+    config = SimpleNamespace(text_config=text_config) if multimodal else text_config
+    model = SimpleNamespace(config=config)
+    if wrapped:
+        model = SimpleNamespace(module=model)
+    targets = torch.arange(3 * 4 * 2).reshape(3, 4, 2)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(sys.modules, "veomni.utils.moe_router_replay", stub)
+        ctrl.install(model)
+        assert captured["active"] is ctrl
+        projected = ctrl.select_routing_layers(targets, from_rollout=True)
+        torch.testing.assert_close(projected, targets[:, [1, 3], :])
+        assert ctrl.select_routing_layers(projected, from_rollout=False) is projected
+        with pytest.raises(RuntimeError, match="routing shape"):
+            ctrl.select_routing_layers(targets[0], from_rollout=True)
+        ctrl.uninstall()
+        ctrl.install(nn.Linear(1, 1))
+        assert ctrl.select_routing_layers(targets, from_rollout=True) is targets
+        ctrl.uninstall()
+
+
+@pytest.mark.parametrize(
+    "layer_types, message",
+    [
+        (["dense"], "length differs"),
+        (["dense", "dense"], "at least one MoE"),
+    ],
+)
+def test_minimax_install_rejects_invalid_layout(ctrl, layer_types, message):
+    stub, captured = _make_veomni_stub()
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            model_type="minimax_m3_vl_text",
+            num_hidden_layers=2,
+            mlp_layer_types=layer_types,
+        )
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(sys.modules, "veomni.utils.moe_router_replay", stub)
+        with pytest.raises(ValueError, match=message):
+            ctrl.install(model)
+        assert captured["active"] is None

@@ -86,3 +86,20 @@ capture path only produces a correctly-sized buffer starting from **vLLM `>= 0.2
 an actionable error when `enable_rollout_routing_replay=True`, instead of crashing
 later inside vLLM.
 
+### MiniMax M3 VL with VeOmni
+
+For mixed dense/MoE FFNs, R3 rollout routing uses absolute decoder-layer
+slots; the VeOmni engine selects the sparse layers from `mlp_layer_types`.
+For the 60-layer / 8-expert diagnostic model, slots 3 through 59 become the
+57 router targets. R2 actor recordings are already MoE-only. Replay replaces
+expert indices before sigmoid weight gathering and renormalization; it does
+not copy rollout routing weights. Duplicate-index target rows are routed
+natively, so coverage checks must distinguish missing routes from valid rows.
+
+Enable with `actor_rollout_ref.actor.veomni.router_replay.mode=R3` and
+`actor_rollout_ref.rollout.enable_rollout_routing_replay=True`. The current
+Ascend checkout requires `VLLM_USE_V2_MODEL_RUNNER=1` for routed-expert capture;
+propagate this environment variable to rollout workers.
+
+See [MiniMax integration and validation](MINIMAX_M3_VALIDATION.md) for the
+companion repositories, tests and known limits.

@@ -10,11 +10,66 @@ from torch.nn import functional as F
 from veomni.lora.moe_layers import LoraIndependentExperts, LoraSharedExperts
 
 from verl.workers.engine.veomni.m3_lora import (
+    _merged_m3_weight,
     adapters_disabled,
     merged_m3_lora_weights,
     wrap_m3_lora,
 )
 from verl.workers.engine.veomni.m3_weight_export import iter_m3_param
+
+
+@pytest.mark.parametrize("experts", [None, 3])
+@pytest.mark.parametrize("zero_b", [False, True])
+def test_merged_forward_chain_rule_and_frozen_base(experts, zero_b):
+    """Direct-weight merge retains FP32 master gradients under BF16 autocast."""
+    torch.manual_seed(461)
+    prefix = () if experts is None else (experts,)
+    base = torch.randn(*prefix, 24, 32).bfloat16()
+    saved = base.clone()
+    a = (torch.randn(*prefix, 4, 32) * 0.1).requires_grad_()
+    b = (torch.randn(*prefix, 24, 4) * 0.1).requires_grad_()
+    if zero_b:
+        with torch.no_grad():
+            b.zero_()
+    x = torch.randn(*prefix, 7, 32).bfloat16().requires_grad_()
+    scale = 1.5
+
+    def linear(xx, ww):
+        return F.linear(xx, ww) if experts is None else torch.bmm(xx, ww.transpose(-1, -2))
+
+    for step in range(2):
+        a.grad = b.grad = x.grad = None
+        expected_weight = (base.float() + (b.detach() @ a.detach()) * scale).bfloat16()
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            merged = _merged_m3_weight(base, a, b, scale)
+            y = linear(x, merged)
+        torch.testing.assert_close(merged, expected_weight, rtol=0, atol=0)
+        leaf = merged.detach().clone().requires_grad_()
+        xr = x.detach().clone().requires_grad_()
+        ref = linear(xr, leaf)
+        upstream = torch.randn_like(y)
+        y.backward(upstream)
+        ref.backward(upstream)
+        expected_a = b.detach().transpose(-1, -2) @ (leaf.grad.float() * scale)
+        expected_b = (leaf.grad.float() * scale) @ a.detach().transpose(-1, -2)
+        torch.testing.assert_close(x.grad, xr.grad, rtol=0, atol=0)
+        torch.testing.assert_close(a.grad, expected_a, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(b.grad, expected_b, rtol=1e-6, atol=1e-6)
+        assert torch.isfinite(a.grad).all() and torch.isfinite(b.grad).all()
+        assert (a.grad.norm() == 0) if zero_b and step == 0 else (a.grad.norm() > 0)
+        assert b.grad.norm() > 0 and base.grad is None
+        torch.testing.assert_close(base, saved, rtol=0, atol=0)
+        with torch.no_grad():
+            a.add_(a.grad, alpha=-0.01)
+            b.add_(b.grad, alpha=-0.01)
+
+
+def test_merged_forward_rejects_rounded_adapter_masters():
+    base = torch.zeros(8, 8, dtype=torch.bfloat16)
+    a = torch.zeros(4, 8, dtype=torch.bfloat16)
+    b = torch.zeros(8, 4, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="FP32 adapter owners"):
+        _merged_m3_weight(base, a, b, 1.0)
 
 
 class Experts(nn.Module):

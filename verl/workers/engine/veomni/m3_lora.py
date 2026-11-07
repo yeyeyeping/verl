@@ -13,6 +13,7 @@ from types import MethodType
 
 import torch
 from torch.distributed.tensor import DTensor
+from torch.nn import functional as F
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
 from veomni.lora.moe_layers import LoraIndependentExperts, LoraSharedExperts
@@ -62,6 +63,78 @@ def _m3_lora_fp32_modules(self):
     return self._m3_lora_fp32_module_types
 
 
+def _merged_m3_weight(base, a, b, scale):
+    """Differentiable export-equivalent merge; never round the FP32 adapters early."""
+    if a.dtype != torch.float32 or b.dtype != torch.float32:
+        raise RuntimeError("M3 merged forward requires FP32 adapter owners under FSDP")
+    with torch.autocast(device_type=base.device.type, enabled=False):
+        if base.ndim == 2:
+            return (base.float() + (b @ a) * scale).to(base.dtype)
+        if base.ndim != 3 or a.ndim != 3 or b.ndim != 3:
+            raise ValueError("M3 merged forward expects dense or independent expert projections")
+        if not (base.shape[0] == a.shape[0] == b.shape[0]):
+            raise ValueError("M3 merged forward must keep expert projections EP-local")
+        # Match MergedState._expert_projection's individual FP32 GEMMs.
+        return torch.stack(
+            [(w.float() + (be @ ae) * scale).to(base.dtype) for w, ae, be in zip(base, a, b, strict=True)]
+        )
+
+
+def _m3_merged_linear_forward(self, x):
+    adapter = self.active_adapter
+    if self.merged or adapter not in self.lora_A:
+        return self.base_layer(x)
+    weight = _merged_m3_weight(
+        self.base_layer.weight, self.lora_A[adapter].weight, self.lora_B[adapter].weight, self.scaling[adapter]
+    )
+    return F.linear(x, weight, self.base_layer.bias)
+
+
+def _m3_merged_expert_forward(self, fused_kernel, hidden_states, top_k_index, top_k_weights):
+    from veomni.ops.kernels.moe.npu_group_gemm import npu_fused_moe_forward
+
+    gate, up = self.gate_up_proj.base_layer.weight.chunk(2, dim=1)
+
+    def merge(projection, weight):
+        return _merged_m3_weight(
+            weight, self.get_lora_A_weight(projection), self.get_lora_B_weight(projection), self._lora_scale_value
+        )
+
+    return npu_fused_moe_forward(
+        num_experts=self.num_experts,
+        routing_weights=top_k_weights.to(hidden_states.dtype),
+        selected_experts=top_k_index,
+        hidden_states=hidden_states,
+        fc1_1_weight=None,
+        fc1_2_weight=None,
+        fc1_1_2_weight=torch.cat((merge("gate_proj", gate), merge("up_proj", up)), dim=1),
+        fc2_weight=merge("down_proj", self.down_proj.base_layer.weight),
+        swiglu_alpha=self.swiglu_alpha,
+        swiglu_limit=self.swiglu_limit,
+    )
+
+
+def enable_m3_merged_forward(model, moe_implementation):
+    """Opt-in accuracy mode with export-equivalent forward and normal autograd.
+
+    This materializes merged matrices and costs more memory/compute than split
+    LoRA. FP32 FSDP policies must be installed on the owners, not A/B containers
+    whose ``forward`` is never invoked by this implementation.
+    """
+    for module in model.modules():
+        if isinstance(module, LoraLinear):
+            if any(isinstance(d, torch.nn.Dropout) and d.p for d in module.lora_dropout.values()):
+                raise ValueError("M3 merged forward requires zero LoRA dropout")
+            module.forward = MethodType(_m3_merged_linear_forward, module)
+        elif isinstance(module, LoraIndependentExperts):
+            if moe_implementation != "fused_npu":
+                raise ValueError("M3 merged expert forward currently requires fused_npu")
+            module._fused_forward = MethodType(_m3_merged_expert_forward, module)
+        elif isinstance(module, LoraSharedExperts):
+            raise ValueError("M3 merged forward currently supports independent expert adapters only")
+    model._m3_lora_forward_mode = "merged"
+
+
 def prepare_m3_lora_dtypes(model):
     """Set storage dtypes before FSDP and keep router computation in FP32.
 
@@ -92,7 +165,10 @@ def prepare_m3_lora_dtypes(model):
     routers = tuple(
         type(module) for name, module in model.named_modules() if name == "mlp.gate" or name.endswith(".mlp.gate")
     )
-    model._m3_lora_fp32_module_types = tuple(dict.fromkeys((*ignored, *routers)))
+    owners = (
+        (LoraLinear, LoraIndependentExperts) if getattr(model, "_m3_lora_forward_mode", "split") == "merged" else ()
+    )
+    model._m3_lora_fp32_module_types = tuple(dict.fromkeys((*ignored, *routers, *owners)))
     model.get_ignore_modules_in_mixed_precision = MethodType(_m3_lora_fp32_modules, model)
     LOG.warning("M3_LORA dtype policy: frozen=BF16 trainable/router/correction_bias=FP32")
 
@@ -294,6 +370,11 @@ def install():
             raise ValueError("Use verl checkpoint resume for this bridge; adapter import is unsupported")
         if not self.model_config.lora.get("merge", False):
             raise ValueError("M3 LoRA requires model.lora.merge=True for ordinary vLLM weight sync")
+        forward_mode = self.model_config.lora.get("forward_mode", "split")
+        if forward_mode not in ("split", "merged"):
+            raise ValueError("M3 LoRA forward_mode must be split or merged")
+        if forward_mode == "merged" and self.engine_config.low_precision_reduce_scatter_comm:
+            raise ValueError("M3 merged forward requires native FP32 gradient communication")
         ops = impl._build_ops_implementation_config(self.engine_config)
         mp = impl.MixedPrecisionConfig(enable=self.engine_config.mixed_precision)
         if not mp.enable:
@@ -315,6 +396,9 @@ def install():
             self.model_config.lora.get("moe_mode", "independent"),
             moe_implementation=self.engine_config.moe_implementation,
         )
+        if forward_mode == "merged":
+            enable_m3_merged_forward(module, self.engine_config.moe_implementation)
+        LOG.warning("M3_LORA forward_mode=%s", forward_mode)
         prepare_m3_lora_dtypes(module)
         self._maybe_apply_async_activation_offload(module)
         with isolated_weight_metadata():

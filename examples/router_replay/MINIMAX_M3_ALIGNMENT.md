@@ -1,7 +1,8 @@
 # MiniMax M3 alignment integration
 
-The three companion repositories use `3.1flash/full_param`, based on their
-`3.1flash/router_replay` commits. The branch name does not select full-weight
+The synchronized branches are verl `3.1flash/lora_verl`, VeOmni
+`3.1flash/lora_expert`, and vllm-ascend `3.1flash/lora_ascend`. They include
+the earlier `3.1flash/full_param` and `3.1flash/router_replay` commits. The branch name does not select full-weight
 training: LoRA remains opt-in and its forward mode defaults to `split`.
 
 ## Activation
@@ -36,7 +37,7 @@ it is not a substitute for `forward_mode=merged`.
 - Fused main/index Q/K Norm rounds `1 + weight` to the weight storage dtype
   before FP32 multiplication, matching the existing unfused path. The 512-token
   fusion eligibility limit and the unfused path are unchanged.
-- GBSA metadata and backward use the same `softmax_precision=1` attributes;
+- GBSA metadata and backward use `softmax_precision=0`, matching the installed CANN gradient API;
   explicit packed used lengths remain intact. Forward `inner_precise=0` is a
   different operator parameter and is unchanged.
 - Geo3k already accepts matching `<mm:think>` tags, with 0.1 format reward.
@@ -50,8 +51,23 @@ in that earlier remote validation. The fixed-input NPU norm comparison used two
 in-place weight updates and 1/64/512/513-token inputs; mean output error dropped
 from about 1e-3 to 0--1e-6. These are norm-output errors, not full-model logprobs.
 
-Desktop synchronization additionally updates the existing GBSA test's metadata
-and backward expectations from precision 0 to 1. Local static checks and source
+The earlier desktop synchronization changed GBSA test expectations from
+precision 0 to 1; the current snapshot restores the supported precision 0. Local static checks and source
 hash comparisons are separate from the earlier remote runtime results. No new
 NPU training, multi-node launch, or server configuration change is part of this
 desktop synchronization.
+
+## Running snapshot update (2026-11-08)
+
+The current four-node run enables
+`actor_rollout_ref.actor.veomni.enable_pageable_activation_offload=True`.
+This option defaults to false. It wraps the training forward outside the
+checkpoint boundary with VeOmni `custom_save_on_cpu(gpu_limit_in_gb=0.0,
+pin_memory=False)`; forward-only evaluation is unchanged. Pair it with the
+VeOmni frozen-weight transpose exclusion to avoid restoring a duplicate full
+vocabulary head. Merged LoRA still requires zero LoRA dropout.
+
+The earlier precision-one experiment described above was reverted in the live
+source: the installed GBSA gradient metadata operator accepts precision zero.
+Use precision zero for both metadata and backward, as in the synchronized
+VeOmni implementation.

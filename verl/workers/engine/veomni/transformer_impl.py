@@ -511,7 +511,14 @@ class VeOmniEngine(FSDPEngine):
             output_lst = []
 
             for micro_batch in micro_batches:
-                with ctx:
+                # Outside the checkpoint boundary: offload saved layer inputs,
+                # leaving recomputation and all parameter arithmetic unchanged.
+                activation_ctx = nullcontext()
+                if not forward_only and self.engine_config.enable_pageable_activation_offload:
+                    from veomni.distributed.offloading import custom_save_on_cpu
+
+                    activation_ctx = custom_save_on_cpu(gpu_limit_in_gb=0.0, pin_memory=False)
+                with ctx, activation_ctx:
                     loss, meta_info = self.forward_step(
                         micro_batch, loss_function=loss_function, forward_only=forward_only
                     )

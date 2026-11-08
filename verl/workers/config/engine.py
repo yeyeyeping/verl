@@ -409,6 +409,8 @@ class VeOmniEngineConfig(EngineConfig):
 
     _mutable_fields = EngineConfig._mutable_fields | {"attn_implementation"}
 
+    # Synchronous, unpinned CPU storage for tensors saved by the training forward.
+    enable_pageable_activation_offload: bool = False
     forward_prefetch: bool = False
     entropy_from_logits_with_chunking: bool = False
     entropy_from_logits_chunk_size: int = 2048

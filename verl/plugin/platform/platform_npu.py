@@ -155,6 +155,11 @@ class PlatformNPU(PlatformBase):
             # use VLLM_ASCEND_TASK_QUEUE_ENABLE to support different TASK_QUEUE_ENABLE mode for
             # train and rollout on Ascend NPU
             env_vars["TASK_QUEUE_ENABLE"] = os.environ["VLLM_ASCEND_TASK_QUEUE_ENABLE"]
+        # Override HCCL only for rollout server actors and their child workers.
+        # Do not change the trainer's process environment or communication mode.
+        rollout_hccl_mode = os.environ.get("VERL_ROLLOUT_HCCL_OP_EXPANSION_MODE")
+        if rollout_hccl_mode:
+            env_vars["HCCL_OP_EXPANSION_MODE"] = rollout_hccl_mode
         return env_vars
 
     # ------------------------------------------------------------------

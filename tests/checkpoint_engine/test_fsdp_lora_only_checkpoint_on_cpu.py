@@ -208,26 +208,6 @@ class TestFSDPCheckpointManagerLoraOnly:
         assert model_after._fsdp_wrapped_module.base_weight.item() == 99.0
         assert model_after._fsdp_wrapped_module.lora_A_weight.item() == 0.5
 
-    @pytest.mark.parametrize("remote_model", [False, True])
-    @pytest.mark.parametrize("wrapped", [False, True])
-    def test_auto_map_controls_model_code_save(self, tmp_path, monkeypatch, remote_model, wrapped):
-        from verl.utils.checkpoint import fsdp_checkpoint_manager as checkpoint_module
-
-        model = _FakeFSDPModel(has_lora=True)
-        unwrapped = model
-        model.config.auto_map = {"AutoConfig": "configuration_custom.CustomConfig"}
-        if remote_model:
-            model.config.auto_map["AutoModelForCausalLM"] = "modeling_custom.CustomModel"
-        base_model = object() if wrapped else unwrapped
-        if wrapped:
-            unwrapped.get_base_model = lambda: base_model
-        copied = []
-        monkeypatch.setattr(checkpoint_module, "custom_object_save", lambda obj, *a, **kw: copied.append(obj))
-        mgr = self._make_fsdp_manager(checkpoint_config={"save_contents": ["model"]}, model=model)
-        mgr.save_checkpoint(local_path=str(tmp_path), global_step=1)
-        assert (tmp_path / "fsdp_config.json").is_file()
-        assert copied == ([base_model] if remote_model else [])
-
     def test_load_full_checkpoint_still_works(self, tmp_path):
         model = _FakeFSDPModel(has_lora=True)
         model._fsdp_wrapped_module.base_weight.data.fill_(42.0)

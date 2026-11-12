@@ -41,8 +41,7 @@ engine starts.
 import logging
 import math
 import os
-import sys
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import torch
@@ -164,16 +163,8 @@ def fold_unquantized_moe_params(layers: list[torch.nn.Module]):
 
     from vllm.model_executor.layers.fused_moe import unquantized_fused_moe_method
 
-    targets = [unquantized_fused_moe_method]
-    # Ascend imports its own alias; patch it too so each layer folds immediately.
-    # Only inspect loaded modules: CPU/CUDA callers must not import torch_npu.
-    ascend = sys.modules.get("vllm_ascend.ops.fused_moe.routed_experts")
-    if ascend is not None and hasattr(ascend, "replace_parameter"):
-        targets.append(ascend)
-    with ExitStack() as stack:
-        for target in targets:
-            folding = _folding_replace_parameter(target.replace_parameter)
-            stack.enter_context(patch.object(target, "replace_parameter", folding))
+    folding = _folding_replace_parameter(unquantized_fused_moe_method.replace_parameter)
+    with patch.object(unquantized_fused_moe_method, "replace_parameter", folding):
         yield
 
     for layer in layers:

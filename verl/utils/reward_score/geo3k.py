@@ -17,9 +17,30 @@ from mathruler.grader import extract_boxed_content, grade_answer
 
 
 def format_reward(predict_str: str) -> float:
-    pattern = re.compile(r"<(?P<think_tag>(?:mm:)?think)>.*</(?P=think_tag)>.*\\boxed\{.*\}.*", re.DOTALL)
-    match_result = re.fullmatch(pattern, predict_str)
-    return 1.0 if match_result else 0.0
+    """Accept legacy/M3 thinking and adaptive direct answers with a final box."""
+    text = predict_str.strip()
+    marker_pattern = r"</?(?:mm:)?think>"
+    thinking = re.fullmatch(
+        r"<(?P<tag>think|mm:think)>(?P<reasoning>.*?)</(?P=tag)>(?P<answer>.*)",
+        text,
+        re.DOTALL,
+    )
+    if thinking:
+        # Reject nested, mixed, or repeated thinking blocks.
+        if re.search(marker_pattern, thinking.group("reasoning")):
+            return 0.0
+        answer = thinking.group("answer").strip()
+    elif text.startswith("</mm:think>"):
+        # M3's adaptive no-thinking form may start with the end marker alone.
+        answer = text[len("</mm:think>") :].strip()
+    else:
+        answer = text
+    if re.search(marker_pattern, answer):
+        return 0.0
+    # Use the same balanced-brace extractor as accuracy scoring, but only on
+    # the final answer so a box inside the reasoning cannot earn format credit.
+    boxed = extract_boxed_content(answer)
+    return 1.0 if boxed and boxed != "None" else 0.0
 
 
 def acc_reward(predict_str: str, ground_truth: str, use_boxed: bool = True) -> float:

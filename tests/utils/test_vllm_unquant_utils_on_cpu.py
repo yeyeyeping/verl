@@ -378,25 +378,3 @@ def test_a_layer_left_staged_by_a_failed_refit_is_restaged_from_its_live_params(
     for name, param in live.items():
         assert getattr(layer, name) is param
         assert torch.equal(param.data, _block_layout(weights[name]))
-
-
-def test_ascend_replace_alias_folds_into_live_storage_and_is_restored(vllm, monkeypatch):
-    alias = types.ModuleType("vllm_ascend.ops.fused_moe.routed_experts")
-    alias.replace_parameter = _replace_parameter
-    monkeypatch.setitem(sys.modules, alias.__name__, alias)
-    layer = _FakeRoutedExperts(vllm.unquantized.UnquantizedFusedMoEMethod())
-    model = _engine_init(vllm, [layer])
-    live = {name: getattr(layer, name) for name in ("w13_weight", "w2_weight")}
-    staged = unquant_utils.stage_unquantized_moe_params(model)
-    weights = _new_weights(seed=41)
-    _load(layer, weights)
-
-    with unquant_utils.fold_unquantized_moe_params(staged):
-        for name in live:
-            alias.replace_parameter(layer, name, _block_layout(getattr(layer, name).data), prefer_copy=True)
-
-    assert alias.replace_parameter is _replace_parameter
-    assert vllm.unquantized.replace_parameter is _replace_parameter
-    for name, param in live.items():
-        assert getattr(layer, name) is param
-        torch.testing.assert_close(param, _block_layout(weights[name]))

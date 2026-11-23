@@ -23,6 +23,7 @@ import torch_npu
 from packaging import version
 from torch_npu.npu import mstx
 
+from .actor_minibatch_once import actor_update_scope
 from .config import NPUToolConfig
 from .profile import DistProfiler, ProfilerConfig
 
@@ -186,8 +187,15 @@ class NPUProfiler(DistProfiler):
         self.profile_level = tool_config.level
         self.profile_save_path = config.save_path
         self.analysis = tool_config.analysis
+        self.rank = rank
+        self.actor_minibatch_once = tool_config.actor_minibatch_once
+        self._actor_minibatch_captured = False
+        self._profile_step = None
+        if self.actor_minibatch_once and not self.discrete:
+            raise ValueError('actor_minibatch_once requires discrete NPU profiling')
 
     def start(self, **kwargs):
+        self._profile_step = kwargs.get("profile_step")
         role = kwargs.get("role", None)
         if not self.discrete and NPUProfiler._define_count == 0:
             self.profile_npu = get_npu_profiler(
@@ -197,11 +205,13 @@ class NPUProfiler(DistProfiler):
                 analysis=self.analysis,
                 role=role,
             )
+            torch_npu.npu.synchronize()
             self.profile_npu.start()
             NPUProfiler._define_count += 1
 
     def stop(self):
         if not self.discrete and NPUProfiler._define_count == 1:
+            torch_npu.npu.synchronize()
             self.profile_npu.step()
             self.profile_npu.stop()
             NPUProfiler._define_count -= 1
@@ -235,6 +245,11 @@ class NPUProfiler(DistProfiler):
         def decorator(func):
             @functools.wraps(func)
             def wrapper(*args, **kwargs_inner):
+                if self.actor_minibatch_once:
+                    if role != 'actor_update' or self._actor_minibatch_captured:
+                        return func(*args, **kwargs_inner)
+                    with actor_update_scope(self):
+                        return func(*args, **kwargs_inner)
                 # Prefer the stage label (`role`, e.g. "actor_compute_log_prob"): it names both the
                 # role and the function, which the method name alone cannot do for a colocated
                 # worker. Fall back to the method name for stages that declare no role.

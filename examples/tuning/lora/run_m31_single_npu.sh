@@ -60,7 +60,8 @@ set -u
 export PYTHONPATH="/mnt/share/y00977881/env/veomni/python:$PROJECT/VeOmni:$PROJECT/verl:$PROJECT/vllm:$PROJECT/vllm-ascend-private:${PYTHONPATH:-}"
 export VERL_PLATFORM=huawei MODELING_BACKEND=veomni PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1
 export TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=1
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:False
+export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:False,segment_size_mb:256}
+export MULTI_STREAM_MEMORY_REUSE=${MULTI_STREAM_MEMORY_REUSE:-2}
 export VLLM_WORKER_MULTIPROC_METHOD=spawn VERL_UPDATE_WEIGHTS_INTERVAL=1
 export HCCL_CONNECT_TIMEOUT=300 HCCL_EXEC_TIMEOUT=1800
 export HCCL_NPU_SOCKET_PORT_RANGE=auto HCCL_HOST_SOCKET_PORT_RANGE=auto
@@ -136,6 +137,9 @@ CMD=(python -m verl.trainer.main_ppo
     actor_rollout_ref.actor.veomni.moe_implementation=fused_npu
     actor_rollout_ref.actor.veomni.attn_implementation=flash_attention_2
     actor_rollout_ref.actor.veomni.minimax_sparse_attention_implementation=npu
+    actor_rollout_ref.actor.veomni.rms_norm_implementation=npu
+    actor_rollout_ref.actor.veomni.forward_prefetch=True
+    actor_rollout_ref.actor.veomni.skip_video_dummy=True
     actor_rollout_ref.actor.veomni.enable_full_shard=True
     actor_rollout_ref.actor.veomni.enable_reentrant=False
     actor_rollout_ref.actor.veomni.param_offload=True
@@ -193,6 +197,8 @@ CMD=(python -m verl.trainer.main_ppo
     "++ray_kwargs.ray_init.address=$RAY_ADDRESS"
     "ray_kwargs.ray_init.runtime_env.py_executable=$ENV_DIR/bin/python"
     "++ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH=$PYTHONPATH"
+    "++ray_kwargs.ray_init.runtime_env.env_vars.PYTORCH_NPU_ALLOC_CONF='$PYTORCH_NPU_ALLOC_CONF'"
+    "++ray_kwargs.ray_init.runtime_env.env_vars.MULTI_STREAM_MEMORY_REUSE='$MULTI_STREAM_MEMORY_REUSE'"
 
 )
 CMD+=("$@")

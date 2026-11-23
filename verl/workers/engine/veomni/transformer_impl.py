@@ -39,6 +39,7 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import fsdp_version
 from verl.utils.model import convert_weight_keys
 from verl.utils.profiler import log_gpu_memory_usage
+from verl.utils.profiler.actor_minibatch_once import profile_phase
 from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_group,
     set_ulysses_sequence_parallel_group,
@@ -157,7 +158,28 @@ class VeOmniEngine(FSDPEngine):
 
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         if use_remove_padding and model_inputs.get("position_ids", None) is not None:
-            model_inputs.update(_prepare_veomni_flash_attention_kwargs(model_inputs["position_ids"]))
+            fa_positions = model_inputs["position_ids"]
+            prepare_sparse = (
+                self.module.config.model_type == "minimax_m3_vl"
+                and model_inputs["input_ids"].device.type == "npu"
+            )
+            if prepare_sparse:
+                # Final global packed positions, before SP slices position_ids.
+                # One explicit host read at input preparation, never per layer.
+                fa_positions = fa_positions.cpu()
+            model_inputs.update(_prepare_veomni_flash_attention_kwargs(fa_positions))
+            if prepare_sparse:
+                from veomni.ops.kernels.minimax_sparse_attention.metadata import prepare_sparse_attention_metadata
+
+                model_inputs["sparse_attention_metadata"] = prepare_sparse_attention_metadata(
+                    model_inputs["cu_seq_lens_q"], model_inputs["max_length_q"],
+                    model_inputs["input_ids"].device,
+                )
+                # FSDP recursively moves top-level tensors. Keep host prefixes
+                # inside the opaque owner, and give FSDP already-uploaded views.
+                metadata = model_inputs["sparse_attention_metadata"]
+                model_inputs["cu_seq_lens_q"] = metadata.cu
+                model_inputs["cu_seq_lens_k"] = metadata.cu
             if sp_enabled:
                 model_inputs["position_ids"] = sp_shard_collator.sp_slice(model_inputs["position_ids"], dim=-1)
 
@@ -404,6 +426,30 @@ class VeOmniEngine(FSDPEngine):
         )
         log_gpu_memory_usage("After load base model", logger=logger)
 
+        if self.engine_config.freeze_vision_tower:
+            vision_tower = getattr(getattr(module, "model", None), "vision_tower", None)
+            if vision_tower is None:
+                raise ValueError("freeze_vision_tower requires model.vision_tower")
+            vision_tower.requires_grad_(False)
+            vision_ids = {id(p) for p in vision_tower.parameters()}
+            projector = module.model.multi_modal_projector
+            if not all(p.requires_grad for p in projector.parameters()):
+                raise RuntimeError("ViT-only freeze must leave the projector trainable")
+            logger.info(
+                "VIT_FREEZE_PASS rank=%s frozen_numel=%s projector_trainable_numel=%s other_trainable_numel=%s",
+                dist.get_rank(), sum(p.numel() for p in vision_tower.parameters()),
+                sum(p.numel() for p in projector.parameters() if p.requires_grad),
+                sum(p.numel() for p in module.parameters() if id(p) not in vision_ids and p.requires_grad),
+            )
+
+        if self.engine_config.skip_video_dummy:
+            if module.config.model_type != "minimax_m3_vl":
+                raise ValueError("skip_video_dummy is supported only for MiniMax M3 VL")
+            if not self.engine_config.freeze_vision_tower:
+                raise ValueError("The image-only recipe requires freeze_vision_tower")
+            module.model.skip_video_dummy = True
+            logger.info("VIDEO_DUMMY_DISABLED rank=%s", dist.get_rank())
+
         self._maybe_apply_async_activation_offload(module)
 
         # Applies parallel strategies to the model.
@@ -422,14 +468,51 @@ class VeOmniEngine(FSDPEngine):
             ),
             enable_reentrant=self.engine_config.enable_reentrant,
             enable_forward_prefetch=self.engine_config.forward_prefetch,
-            broadcast_model_weights_from_rank0=True,
+            broadcast_model_weights_from_rank0=self.engine_config.broadcast_model_weights_from_rank0,
             fqn_to_index_mapping=load_safetensors_index(self.model_config.local_path),
         )
+        # This isolated experiment disables both explicit and implicit FSDP2 prefetch.
+        if not self.engine_config.forward_prefetch:
+            from types import MethodType
+            from torch.distributed.fsdp import FSDPModule
+
+            def _no_backward_prefetch(group):
+                # Preserve bookkeeping normally consumed by default backward prefetch.
+                if group._post_forward_indices:
+                    group._post_forward_indices.pop()
+
+            disabled_groups = 0
+            for child in module.modules():
+                if not isinstance(child, FSDPModule):
+                    continue
+                state = child._get_fsdp_state()
+                state._states_to_forward_prefetch = []
+                state._states_to_backward_prefetch = []
+                group = state._fsdp_param_group
+                if group is not None:
+                    group._backward_prefetch = MethodType(_no_backward_prefetch, group)
+                    # On-demand all-gather on current stream; retain work.wait safety.
+                    group.unshard_async_op = True
+                    disabled_groups += 1
+            if disabled_groups == 0:
+                raise RuntimeError("No FSDP parameter groups found")
+            print(f"FSDP_PREFETCH_DISABLED rank={dist.get_rank()} groups={disabled_groups} "
+                  f"forward_only={self.engine_config.forward_only} implicit_allgather=False", flush=True)
+
         log_gpu_memory_usage("After parallelize model", logger=logger)
 
         if not self.engine_config.forward_only:
             # Initialize optimizer with model parameters and config settings
             optimizer = self._build_optimizer(module)
+            if self.engine_config.freeze_vision_tower:
+                frozen = list(module.model.vision_tower.parameters())
+                if any(p.requires_grad for p in frozen):
+                    raise RuntimeError("FSDP changed frozen ViT trainability")
+                opts = list(optimizer.optimizers_dict.values()) if getattr(optimizer, "_is_multi_optimizer", False) else [optimizer]
+                optim_ids = {id(p) for opt in opts for group in opt.param_groups for p in group["params"]}
+                if any(id(p) in optim_ids for p in frozen):
+                    raise RuntimeError("Frozen ViT parameters must not enter the optimizer")
+                logger.info("VIT_OPTIMIZER_EXCLUSION_PASS rank=%s", dist.get_rank())
             # Create learning rate scheduler with warmup and decay settings
             lr_scheduler = self._build_lr_scheduler(optimizer)
         else:
@@ -441,6 +524,7 @@ class VeOmniEngine(FSDPEngine):
         self.lr_scheduler = lr_scheduler
 
     @_with_engine_parallel_state
+    @profile_phase("actor_optimizer")
     def optimizer_step(self):
         """
         Perform an optimization step using the optimizer.
@@ -510,7 +594,7 @@ class VeOmniEngine(FSDPEngine):
         try:
             output_lst = []
 
-            for micro_batch in micro_batches:
+            for micro_idx, micro_batch in enumerate(micro_batches):
                 # Outside the checkpoint boundary: offload saved layer inputs,
                 # leaving recomputation and all parameter arithmetic unchanged.
                 activation_ctx = nullcontext()
@@ -518,12 +602,13 @@ class VeOmniEngine(FSDPEngine):
                     from veomni.distributed.offloading import custom_save_on_cpu
 
                     activation_ctx = custom_save_on_cpu(gpu_limit_in_gb=0.0, pin_memory=False)
-                with ctx, activation_ctx:
+                with ctx, activation_ctx, profile_phase(f"actor_forward/micro_{micro_idx:03d}"):
                     loss, meta_info = self.forward_step(
                         micro_batch, loss_function=loss_function, forward_only=forward_only
                     )
                 if not forward_only:
-                    loss.backward()
+                    with profile_phase(f"actor_backward/micro_{micro_idx:03d}"):
+                        loss.backward()
 
                 output_lst.append(meta_info)
 

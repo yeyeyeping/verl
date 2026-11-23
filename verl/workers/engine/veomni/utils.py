@@ -102,7 +102,33 @@ def offload_veomni_optimizer(optimizer):
                 state = opt.state[param]
                 for key, value in state.items():
                     if isinstance(value, torch.Tensor):
-                        state[key] = value.to("cpu", non_blocking=False)
+                        use_async = not getattr(opt, "_pageable_offload", False)
+                        try:
+                            state[key] = value.to("cpu", non_blocking=use_async)
+                        except torch.OutOfMemoryError as error:
+                            if not use_async or "allocate_host_memory" not in str(error):
+                                raise
+                            # Pinned HBM-to-host destinations share a limited host pool on this node.
+                            # Keep unloading optimizer state, using pageable CPU memory on this optimizer.
+                            opt._pageable_offload = True
+                            print("OPTIMIZER_OFFLOAD_PAGEABLE_FALLBACK", flush=True)
+                            state[key] = value.to("cpu", non_blocking=False)
+
+    if not getattr(optimizer, "_offload_reported", False):
+        pinned_bytes = total_bytes = 0
+        for opt in optimizers:
+            for state in opt.state.values():
+                for key, value in state.items():
+                    if not isinstance(value, torch.Tensor) or key == "step":
+                        continue
+                    local = value.to_local() if hasattr(value, "to_local") else value
+                    size = local.numel() * local.element_size()
+                    total_bytes += size
+                    if local.device.type == "cpu" and local.is_pinned():
+                        pinned_bytes += size
+        if total_bytes:
+            print(f"OPTIMIZER_OFFLOAD_PIN_STATUS pinned_bytes={pinned_bytes} total_bytes={total_bytes}", flush=True)
+            optimizer._offload_reported = True
 
 
 @torch.no_grad()

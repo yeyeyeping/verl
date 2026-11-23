@@ -387,6 +387,10 @@ def install():
             ops_implementation=ops,
             init_device=self.engine_config.init_device,
         )
+        # This bridge only trains text adapters. Skipping the video dummy for
+        # image-only batches does not require making the projector trainable.
+        if self.engine_config.skip_video_dummy:
+            module.model.skip_video_dummy = True
         module = wrap_m3_lora(
             module,
             self.model_config.lora_rank,
@@ -418,7 +422,7 @@ def install():
                 ),
                 enable_reentrant=self.engine_config.enable_reentrant,
                 enable_forward_prefetch=self.engine_config.forward_prefetch,
-                broadcast_model_weights_from_rank0=True,
+                broadcast_model_weights_from_rank0=self.engine_config.broadcast_model_weights_from_rank0,
                 fqn_to_index_mapping=impl.load_safetensors_index(self.model_config.local_path),
             )
         self.module = module

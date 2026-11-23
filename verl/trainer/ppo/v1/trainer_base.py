@@ -474,7 +474,7 @@ class PPOTrainer(ABC):
             with marked_timer("step", self.timing_raw):
                 self.on_step_begin()
 
-                self._start_profiling()
+                # Sync trainer starts capture after colocated rollout has slept.
                 batch = self.step(metrics, self.timing_raw)
                 self._stop_profiling()
 

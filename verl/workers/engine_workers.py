@@ -42,6 +42,7 @@ from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
+from verl.utils.profiler.actor_minibatch_once import profile_actor_minibatch
 from verl.utils.py_functional import append_to_dict
 from verl.utils.qat import dispatch_rollout_weight_quantizer
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
@@ -319,37 +320,38 @@ class TrainingWorker(Worker, DistProfilerExtension):
             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
-                maybe_fix_3d_position_ids(mini_batch_td)
-                # add global token num
-                if "input_ids" in mini_batch_td:
-                    global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
-                    # allgather from dp rank
-                    global_token_num_output = [None] * torch.distributed.get_world_size(
-                        self.engine.get_data_parallel_group()
-                    )
-                    torch.distributed.all_gather_object(
-                        global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
-                    )
-                    global_token_num = [x for xs in global_token_num_output for x in xs]
-                else:
-                    global_token_num = None
+                with profile_actor_minibatch(batch_idx):
+                    maybe_fix_3d_position_ids(mini_batch_td)
+                    # add global token num
+                    if "input_ids" in mini_batch_td:
+                        global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
+                        # allgather from dp rank
+                        global_token_num_output = [None] * torch.distributed.get_world_size(
+                            self.engine.get_data_parallel_group()
+                        )
+                        torch.distributed.all_gather_object(
+                            global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
+                        )
+                        global_token_num = [x for xs in global_token_num_output for x in xs]
+                    else:
+                        global_token_num = None
 
-                tu.assign_non_tensor(
-                    mini_batch_td,
-                    global_token_num=NonTensorData(global_token_num),
-                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
-                    disable_auto_offload=True,
-                )
-                # Name the mini-batch in the trace so each iteration of this otherwise identical
-                # loop is distinguishable when the whole step is recorded (continuous mode).
-                with torch.profiler.record_function(f"mini_batch{batch_idx}"):
-                    actor_output = self.train_batch(mini_batch_td)
-                # Advance the profiler once per mini-batch. This drives any
-                # torch.profiler.schedule (the schedule's unit is one update mini-batch) and,
-                # with no schedule, only labels torch's ProfilerStep#<n> boundary. start()/stop()
-                # happen on the outer worker, but the profiler is process-global so this reaches it.
-                self.profiler.step()
-                output_lst.append(actor_output)
+                    tu.assign_non_tensor(
+                        mini_batch_td,
+                        global_token_num=NonTensorData(global_token_num),
+                        update_lr_scheduler=batch_idx == total_num_iterations - 1,
+                        disable_auto_offload=True,
+                    )
+                    # Name the mini-batch in the trace so each iteration of this otherwise identical
+                    # loop is distinguishable when the whole step is recorded (continuous mode).
+                    with torch.profiler.record_function(f"mini_batch{batch_idx}"):
+                        actor_output = self.train_batch(mini_batch_td)
+                    # Advance the profiler once per mini-batch. This drives any
+                    # torch.profiler.schedule (the schedule's unit is one update mini-batch) and,
+                    # with no schedule, only labels torch's ProfilerStep#<n> boundary. start()/stop()
+                    # happen on the outer worker, but the profiler is process-global so this reaches it.
+                    self.profiler.step()
+                    output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():
                 actor_output = [tu.get(output, "metrics") for output in output_lst]

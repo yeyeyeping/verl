@@ -42,3 +42,6 @@ class PPOTrainerSync(PPOTrainer):
         self.checkpoint_manager.sleep_replicas()
         if self.curr_step_profile:
             self._stop_rollout_profiling()
+        self._start_profiling()
+        if self.curr_step_profile:
+            print("PROFILE_CAPTURE_AFTER_ROLLOUT_SLEEP", self.global_steps, flush=True)

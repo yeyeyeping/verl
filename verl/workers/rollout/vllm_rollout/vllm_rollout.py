@@ -141,8 +141,13 @@ class ServerAdapter(BaseRollout):
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
 
         self.use_shm = get_device_name() == "npu" or not is_support_ipc()
+        logger.warning(
+            "Weight transfer transport: %s (device=%s)",
+            "host_shared_memory" if self.use_shm else "device_ipc",
+            get_device_name(),
+        )
         self._delta_weight_transfer_engine_initialized = False
-        if self.use_shm:
+        if self.use_shm and get_device_name() != "npu":
             logger.warning(
                 "IPC is not supported on your devices. Falling back to shared memory for weight transfer, "
                 "which may cause performance degradation. If you are using Ascend NPUs, please ensure that "

@@ -220,6 +220,9 @@ class PrecisionDebuggerToolConfig(BaseConfig):
 class NPUToolConfig(NsightToolConfig):
     """NPU profiler too; config."""
 
+    # Profile the first complete actor PPO minibatch in the selected RL step.
+    actor_minibatch_once: bool = False
+
     # options: npu, cpu, memory, shapes, module, stack
     # CPU activity is collected either way (the per-stage mstx markers are CPU-side events),
     # so listing "cpu" here is redundant; the other options are honored as written.

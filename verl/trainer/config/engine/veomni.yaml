@@ -127,3 +127,8 @@ router_replay:
   #       ``rollout.enable_rollout_routing_replay=True`` and rollout backend
   #       support for returning the selected indices.
   mode: disabled
+
+# Integration switches; preserve defaults outside optimized recipes.
+freeze_vision_tower: false
+skip_video_dummy: false
+broadcast_model_weights_from_rank0: true

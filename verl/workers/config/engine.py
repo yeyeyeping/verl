@@ -407,6 +407,11 @@ class VeOmniEngineConfig(EngineConfig):
 
     """
 
+    # Freeze only the vision tower before FSDP and optimizer construction.
+    freeze_vision_tower: bool = False
+    skip_video_dummy: bool = False
+    broadcast_model_weights_from_rank0: bool = True
+
     _mutable_fields = EngineConfig._mutable_fields | {"attn_implementation"}
 
     forward_prefetch: bool = False
